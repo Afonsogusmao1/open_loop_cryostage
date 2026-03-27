@@ -1,0 +1,3 @@
+Graficos de barra: python .\plot_crossing_times_bar.py .\min15_custom_legend_per_run_summary.csv --out-prefix min15_crossing_close --title "0 °C crossing time with plate at -15 °C"
+
+Graficos de overlap das medicoes: python .\overlay_probe_runs.py ".\cryostage_log_min10_*.csv" --align-onset --pre-onset-seconds 20 --xmax 1200 --ymin -15 --ymax 20 --out-prefix min10_custom_legend --outdir "."
