@@ -13,7 +13,7 @@ from solver import FreezeStopOptions, PrefillOptions, ThermalBCs
 DEFAULT_RUN_NAME = "baseline_h180_dt2_fill12p5_h2"
 DEFAULT_T_REF_BOUNDS_C = (-20.0, 0.0)
 DEFAULT_REQUIRE_MONOTONE_NONINCREASING = True
-DEFAULT_THETA0 = (0.0, 0.0, -6.0, -12.0, -18.0)
+DEFAULT_THETA0 = (-0.25, -0.5, -6.0, -12.0, -18.0)
 
 
 def build_problem_config() -> OpenLoopProblemConfig:

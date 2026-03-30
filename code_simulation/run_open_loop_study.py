@@ -56,7 +56,7 @@ def _parse_theta_arg(raw_theta: str | None) -> tuple[float, ...] | None:
     parts = [part.strip() for part in raw_theta.split(",")]
     if not parts or any(part == "" for part in parts):
         raise ValueError("--theta0 must be a comma-separated list of floats")
-    return _coerce_theta_tuple((float(part) for part in parts), name="theta0")
+    return _coerce_theta_tuple([float(part) for part in parts], name="theta0")
 
 
 def _build_study_config(*, horizon_s: float, num_knots: int):
@@ -257,6 +257,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maxfev", type=int, default=18, help="Maximum objective evaluations.")
     parser.add_argument("--xatol", type=float, default=0.25, help="Absolute theta convergence tolerance.")
     parser.add_argument("--fatol", type=float, default=1.0e-9, help="Absolute objective convergence tolerance.")
+    parser.add_argument(
+        "--t-ignore-s",
+        type=float,
+        default=None,
+        help="Optional override for the objective's ignored initial period in seconds.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Delete the existing study folder before running.")
     return parser.parse_args()
 
@@ -266,6 +272,8 @@ def main() -> None:
     _configure_matplotlib()
 
     config = _build_study_config(horizon_s=args.horizon_s, num_knots=args.num_knots)
+    if args.t_ignore_s is not None:
+        config = replace(config, t_ignore_s=float(args.t_ignore_s))
     theta0 = _parse_theta_arg(args.theta0)
     if theta0 is None:
         theta0 = _default_theta0_for_config(config)
@@ -294,6 +302,13 @@ def main() -> None:
     print(f"Study folder = {run_dir}")
     print(f"Active T_ref bounds = {config.T_ref_bounds_C}")
     print(f"Monotonicity required = {config.require_monotone_nonincreasing}")
+    print(
+        "Objective settings "
+        f"(tracking_weight={config.tracking_weight:.6f}, "
+        f"smoothness_weight={config.smoothness_weight:.6f}, "
+        f"terminal_weight={config.terminal_weight:.6f}, "
+        f"t_ignore_s={config.t_ignore_s:.6f})"
+    )
     print(f"Knot times (s) = {config.knot_times_s}")
     print(f"Initial theta = {theta0}")
 
