@@ -60,7 +60,7 @@ def _parse_theta_arg(raw_theta: str | None) -> tuple[float, ...] | None:
 
 
 def _build_study_config(*, horizon_s: float, num_knots: int):
-    base_config = build_problem_config()
+    base_config = build_problem_config(formulation="legacy_exploratory")
     if num_knots < 2:
         raise ValueError("num_knots must be at least 2")
     knot_times_s = tuple(float(value) for value in np.linspace(0.0, horizon_s, int(num_knots)))
@@ -68,7 +68,7 @@ def _build_study_config(*, horizon_s: float, num_knots: int):
 
 
 def _default_theta0_for_config(config) -> tuple[float, ...]:
-    base_config = build_problem_config()
+    base_config = build_problem_config(formulation="legacy_exploratory")
     base_tau = np.asarray(base_config.knot_times_s, dtype=np.float64) / float(base_config.horizon_s)
     study_tau = np.asarray(config.knot_times_s, dtype=np.float64) / float(config.horizon_s)
     theta0 = np.interp(study_tau, base_tau, np.asarray(DEFAULT_THETA0, dtype=np.float64))

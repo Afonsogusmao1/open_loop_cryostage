@@ -84,7 +84,7 @@ def _parse_bool(raw: str) -> bool:
 
 
 def _build_config_from_summary(summary: dict[str, str], *, t_ignore_s: float):
-    base_config = build_problem_config()
+    base_config = build_problem_config(formulation="legacy_exploratory")
     knot_times_s = tuple(float(value) for value in ast.literal_eval(summary["knot_times_s"]))
     horizon_s = float(summary["horizon_s"])
     bounds = tuple(float(value) for value in ast.literal_eval(summary["T_ref_bounds_C"]))

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 import time
@@ -246,6 +247,9 @@ def run_case(
     pre_cool_s: float = 0.0,
     t_after_fill_s: float = 3600.0,
     write_every: float = 60.0,
+    write_field_output: bool = True,
+    write_probe_csv: bool = True,
+    show_progress: bool = True,
 
     # Fill
     T_fill_C: float = 21.0,
@@ -305,6 +309,9 @@ def run_case(
 
     Default post-fill stop:
     stop when max(T in fillable region) <= Tf - dT_mushy/2 - extra_subcooling_C.
+
+    Lean runs may disable field output, probe CSV output, or progress printing without
+    changing the physics, front CSV, or freeze-complete event logic.
     """
     comm = MPI.COMM_WORLD
     out_dir = Path(out_dir)
@@ -447,17 +454,21 @@ def run_case(
     probe_values = deque()
     fill_time: float | None = None
 
-    with io.XDMFFile(comm, str(xdmf_path), "w") as xdmf:
-        xdmf.write_mesh(domain)
+    xdmf_context = io.XDMFFile(comm, str(xdmf_path), "w") if write_field_output else nullcontext(None)
+
+    with xdmf_context as xdmf:
+        if xdmf is not None:
+            xdmf.write_mesh(domain)
 
         f_probe = None
         f_front = None
         f_curve = None
 
         if comm.rank == 0:
-            f_probe = open(probes_path, "w", buffering=1)
+            if write_probe_csv:
+                f_probe = open(probes_path, "w", buffering=1)
+                f_probe.write(_format_probe_header(probe_z_m))
             f_front = open(front_path, "w", buffering=1)
-            f_probe.write(_format_probe_header(probe_z_m))
             f_front.write(
                 "time_s,time_since_fill_s,fill_flag,"
                 "z_front_m,z_front_mm,z_front_rel_mm,v_front_mm_per_s,"
@@ -478,14 +489,15 @@ def run_case(
             overwrite_fillable_temperature(V, T, geom=geom, value_C=T_fill_C)
             T_prev.x.array[:] = T.x.array
             T_prev.x.scatter_forward()
-            if comm.rank == 0:
+            if show_progress and comm.rank == 0:
                 print(f"\nFILL at t={current_t:.3f}s -> lower cavity WATER, reset to {T_fill_C} °C")
 
         if prefill_mode == "steady" and pre_cool_s <= 1e-12:
             do_fill(0.0)
 
         t = 0.0
-        xdmf.write_function(T, t)
+        if xdmf is not None:
+            xdmf.write_function(T, t)
 
         temps = eval_prepared(T, probe_pts3, probe_cells, probe_mask, comm_pts)
         if float(fill.value) < 0.5:
@@ -495,7 +507,8 @@ def run_case(
         t_since_fill = (t - fill_time) if (float(fill.value) > 0.5 and fill_time is not None) else np.nan
 
         if comm.rank == 0:
-            f_probe.write(f"{t:.6f},{t_since_fill:.6f},{temps[0]:.6f},{temps[1]:.6f},{temps[2]:.6f}\n")
+            if f_probe is not None:
+                f_probe.write(f"{t:.6f},{t_since_fill:.6f},{temps[0]:.6f},{temps[1]:.6f},{temps[2]:.6f}\n")
             f_front.write(
                 f"{t:.6f},{t_since_fill:.6f},{float(fill.value):.1f},"
                 "nan,nan,nan,nan,nan,nan,nan,nan,0\n"
@@ -567,7 +580,7 @@ def run_case(
                     cp_lat_dbg = float(apparent_cp_bump(np.array([T_dbg]), phase.Tf, phase.L_latent, phase.dT_mushy)[0])
                     phase_dbg = "ice" if T_dbg < phase.Tf else "liquid"
 
-                    if comm.rank == 0:
+                    if show_progress and comm.rank == 0:
                         z_dbg_mm = 1000.0 * float(probe_z_m[idx_dbg])
                         print(
                             "[material-debug] "
@@ -606,7 +619,7 @@ def run_case(
                         window_s=prefill.probe_window_s,
                         tol_C=prefill.probe_tol_C,
                     ):
-                        if comm.rank == 0:
+                        if show_progress and comm.rank == 0:
                             spans = np.ptp(np.asarray(probe_values, dtype=np.float64), axis=0)
                             print(
                                 "\nEMPTY-MOLD probes stabilized -> "
@@ -665,7 +678,8 @@ def run_case(
                         next_curve_since_fill = t_since_fill + float(front_curve_every_s)
 
             if comm.rank == 0:
-                f_probe.write(f"{t:.6f},{t_since_fill:.6f},{temps[0]:.6f},{temps[1]:.6f},{temps[2]:.6f}\n")
+                if f_probe is not None:
+                    f_probe.write(f"{t:.6f},{t_since_fill:.6f},{temps[0]:.6f},{temps[1]:.6f},{temps[2]:.6f}\n")
 
                 if float(fill.value) > 0.5:
                     f_front.write(
@@ -687,44 +701,50 @@ def run_case(
                         + "\n"
                     )
 
-            if t >= next_write - 1e-12:
+            if xdmf is not None and t >= next_write - 1e-12:
                 xdmf.write_function(T, t)
                 next_write += write_every
 
             if float(fill.value) > 0.5 and freeze_complete:
-                if comm.rank == 0:
+                if show_progress and comm.rank == 0:
                     print(
                         f"\nWater-filled region fully frozen at t_since_fill={t_since_fill:.2f}s "
                         f"with Tmax_fillable={Tmax_fillable_C:.4f} °C <= {freeze_threshold_C:.4f} °C. Stopping."
                     )
-                xdmf.write_function(T, t)
+                if xdmf is not None:
+                    xdmf.write_function(T, t)
                 break
 
             if stop_when_wall_frozen and float(fill.value) > 0.5 and np.isfinite(zf_wall):
                 if zf_wall >= geom.H_fill - 1e-12:
-                    if comm.rank == 0:
+                    if show_progress and comm.rank == 0:
                         print(
                             f"\nWall-line frozen at t_since_fill={t_since_fill:.2f}s "
                             f"(r_wall={r_wall*1000.0:.3f} mm). Stopping because stop_when_wall_frozen=True."
                         )
-                    xdmf.write_function(T, t)
+                    if xdmf is not None:
+                        xdmf.write_function(T, t)
                     break
 
-            if comm.rank == 0 and (step % max(1, n_steps // 100) == 0 or step == n_steps):
+            if show_progress and comm.rank == 0 and (step % max(1, n_steps // 100) == 0 or step == n_steps):
                 elapsed = time.perf_counter() - t0_wall
                 sps = elapsed / step
                 eta = sps * (n_steps - step)
                 print(f"\rstep {step}/{n_steps}  {sps:.3f} s/step  ETA {eta:6.1f} s", end="", flush=True)
 
         if comm.rank == 0:
-            print("\nDone.")
-            f_probe.close()
+            if f_probe is not None:
+                f_probe.close()
             f_front.close()
             if enable_front_curve and f_curve is not None:
                 f_curve.close()
 
-            print(f"  XDMF        : {xdmf_path}")
-            print(f"  PROBES CSV  : {probes_path}")
-            print(f"  FRONT CSV   : {front_path}")
-            if enable_front_curve:
-                print(f"  FRONT CURVE : {front_curve_path}")
+            if show_progress:
+                print("\nDone.")
+                if xdmf is not None:
+                    print(f"  XDMF        : {xdmf_path}")
+                if f_probe is not None:
+                    print(f"  PROBES CSV  : {probes_path}")
+                print(f"  FRONT CSV   : {front_path}")
+                if enable_front_curve:
+                    print(f"  FRONT CURVE : {front_curve_path}")

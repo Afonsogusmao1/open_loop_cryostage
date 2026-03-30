@@ -10,13 +10,14 @@ from open_loop_problem import OpenLoopProblemConfig, build_reference_profile_fro
 from solver import FreezeStopOptions, PrefillOptions, ThermalBCs
 
 
-DEFAULT_RUN_NAME = "baseline_h180_dt2_fill12p5_h2"
+DEFAULT_FORMULATION = "full_process_article"
+DEFAULT_RUN_NAME = "full_process_cap2400_dt4_k5"
 DEFAULT_T_REF_BOUNDS_C = (-20.0, 0.0)
 DEFAULT_REQUIRE_MONOTONE_NONINCREASING = True
-DEFAULT_THETA0 = (-0.25, -0.5, -6.0, -12.0, -18.0)
+DEFAULT_THETA0 = (-0.1, -5.5, -11.9, -17.0, -17.2)
 
 
-def build_problem_config() -> OpenLoopProblemConfig:
+def _build_legacy_problem_config() -> OpenLoopProblemConfig:
     horizon_s = 180.0
     return OpenLoopProblemConfig(
         horizon_s=horizon_s,
@@ -51,8 +52,62 @@ def build_problem_config() -> OpenLoopProblemConfig:
             "stop_when_wall_frozen": False,
             "use_tabulated_water_ice": True,
         },
+        front_reference_mode="legacy_linear_speed",
     )
 
+
+def _build_full_process_problem_config() -> OpenLoopProblemConfig:
+    safety_cap_s = 2400.0
+    return OpenLoopProblemConfig(
+        horizon_s=safety_cap_s,
+        cryostage_dt_s=4.0,
+        knot_times_s=(0.0, 90.0, 180.0, 270.0, 360.0),
+        front_target_speed_m_per_s=2.0e-5,
+        tracking_weight=1.0,
+        smoothness_weight=0.02,
+        completion_weight=0.25,
+        t_ignore_s=0.0,
+        T_ref_bounds_C=DEFAULT_T_REF_BOUNDS_C,
+        require_monotone_nonincreasing=DEFAULT_REQUIRE_MONOTONE_NONINCREASING,
+        solver_kwargs={
+            "geom": GeometryParams(
+                R_in=7.5e-3,
+                t_wall=2.0e-3,
+                t_base=0.0,
+                H_fill=15.0e-3,
+                H_total=17.0e-3,
+            ),
+            "Nr": 36,
+            "Nz": 72,
+            "dt": 4.0,
+            "pre_cool_s": 0.0,
+            "write_every": 1.0e9,
+            "write_field_output": False,
+            "write_probe_csv": False,
+            "show_progress": False,
+            "T_fill_C": 12.5,
+            "bcs": ThermalBCs(T_room_C=5.75, h_top=2.0, h_side=2.0),
+            "prefill": PrefillOptions(mode="steady"),
+            "freeze_stop": FreezeStopOptions(mode="fillable_region"),
+            "probe_z_m": (3.0e-3, 6.2e-3, 11.0e-3),
+            "probe_wall_inset_m": 1.0e-3,
+            "Nz_front": 200,
+            "enable_front_curve": False,
+            "stop_when_wall_frozen": False,
+            "use_tabulated_water_ice": True,
+        },
+        front_reference_mode="saturating_full_process",
+        front_reference_alpha=4.0,
+        incomplete_penalty_value=2.0,
+    )
+
+
+def build_problem_config(*, formulation: str = DEFAULT_FORMULATION) -> OpenLoopProblemConfig:
+    if formulation == "legacy_exploratory":
+        return _build_legacy_problem_config()
+    if formulation == "full_process_article":
+        return _build_full_process_problem_config()
+    raise ValueError(f"Unknown formulation={formulation!r}")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a reproducible open-loop optimization.")
@@ -61,6 +116,12 @@ def parse_args() -> argparse.Namespace:
         "--out-root-dir",
         default=str(Path(__file__).resolve().parent / "results" / "open_loop_optimization"),
         help="Root folder where optimization runs are written.",
+    )
+    parser.add_argument(
+        "--formulation",
+        default=DEFAULT_FORMULATION,
+        choices=("full_process_article", "legacy_exploratory"),
+        help="Problem formulation to run.",
     )
     parser.add_argument("--method", default="Nelder-Mead", help="scipy.optimize.minimize method.")
     parser.add_argument("--maxiter", type=int, default=15, help="Maximum optimizer iterations.")
@@ -80,7 +141,7 @@ def _theta_satisfies_active_constraints(theta, config: OpenLoopProblemConfig) ->
 
 def main() -> None:
     args = parse_args()
-    config = build_problem_config()
+    config = build_problem_config(formulation=args.formulation)
     bcs = config.solver_kwargs["bcs"]
     T_fill_C = float(config.solver_kwargs["T_fill_C"])
 
@@ -90,11 +151,25 @@ def main() -> None:
         f"gain={DEFAULT_CRYOSTAGE_PARAMS.gain:.6f}, "
         f"offset_C={DEFAULT_CRYOSTAGE_PARAMS.offset_C:.6f})"
     )
+    print(f"Formulation = {args.formulation}")
     print(f"Active T_ref bounds = {config.T_ref_bounds_C}")
     print(f"Monotonicity required = {config.require_monotone_nonincreasing}")
+    print(f"Safety cap (horizon_s) = {config.safety_cap_s:.1f} s")
+    print(f"Control knot times = {config.knot_times_s}")
+    print(f"Front reference mode = {config.front_reference_mode}")
+    print(
+        "Objective weights "
+        f"(tracking={config.tracking_weight:.6f}, completion={config.completion_weight:.6f}, "
+        f"smoothness={config.smoothness_weight:.6f}, terminal={config.terminal_weight:.6f})"
+    )
     print(
         "Runner thermal settings "
         f"(T_fill_C={T_fill_C:.6f}, h_top={bcs.h_top:.6f}, h_side={bcs.h_side:.6f})"
+    )
+    print(
+        "Runtime settings "
+        f"(Nr={config.solver_kwargs["Nr"]}, Nz={config.solver_kwargs["Nz"]}, "
+        f"dt={config.solver_kwargs["dt"]:.3f}, write_every={config.solver_kwargs["write_every"]:.1f})"
     )
     print(f"Initial theta = {DEFAULT_THETA0}")
 

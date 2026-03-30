@@ -3,7 +3,8 @@
 ## Scope
 This repository maintains an **offline open-loop trajectory design workflow** for controlling freezing-front evolution in a cryostage system.
 The modular workflow already exists, and future work should start from the **current implementation state**, not from the original implementation roadmap.
-The work must stay aligned with the article-oriented objective: generate physically plausible cryostage temperature trajectories, quantify their effect on freezing-front evolution, and identify what is genuinely useful for the article.
+The exploratory **180 s / 240 s / 360 s** studies should be treated as completed scoping work.
+The work must stay aligned with the current article-oriented objective: move the existing cascade toward **full freezing / total solidification** while preserving physically plausible cryostage trajectories and article-useful front-behaviour interpretation.
 
 ## Core control assumptions — do not violate
 1. This is **open-loop trajectory control**, not real-time closed-loop front control.
@@ -68,13 +69,16 @@ There is already a study runner producing:
 - best-run artifacts
 - standard plots for `T_ref(t)`, `T_plate(t)`, front tracking, and optimization history
 
+Treat the exploratory **180 s / 240 s / 360 s** phase as complete.
+The next article-facing phase is **not** another short-window exploratory study; it is a **single full-process open-loop optimization** that runs from fill through solver-detected freeze completion.
+
 ## Current technical priorities
 1. Inspect the current implementation before proposing changes.
 2. Identify only real blockers in the existing workflow.
-3. Validate the cryostage reduced model against characterization data.
-4. Run feasibility and sensitivity studies with the existing pipeline.
-5. Compare runs critically and separate robust behaviour from optimizer artifacts.
-6. Identify the outputs, comparisons, and plots that are genuinely useful for the article.
+3. Use the solver's existing **freeze-complete** logic for the next full-freezing phase instead of inventing a separate completion criterion.
+4. Formulate the next control problem as **one full-process open-loop optimization**, not as more exploratory short-horizon studies.
+5. Keep the objective based on **front-position behaviour** and reference-tracking-style interpretation, not direct raw front-velocity control.
+6. Validate the cryostage reduced model only to the extent needed to support the full-freezing phase and article interpretation.
 7. Do new architecture work only if a real blocking issue is confirmed.
 
 ## Guidance for current work
@@ -83,6 +87,7 @@ There is already a study runner producing:
 - Start with the current entry points and active modules:
   - `run_open_loop_optimization.py`
   - `run_open_loop_study.py`
+  - `run_optimizer_learning_diagnostics.py`
   - `open_loop_problem.py`
   - `open_loop_cascade.py`
   - `cryostage_model.py`
@@ -95,25 +100,23 @@ There is already a study runner producing:
 - Check whether the simplest current model is adequate before proposing a more complex one.
 - Use data-path and folder-name checks before concluding that the model itself is wrong.
 
-### Feasibility and sensitivity studies
-- Use the existing study runner before adding new orchestration code.
-- Prefer small controlled studies over broad parameter sweeps unless explicitly requested.
-- Compare studies using summaries, history CSVs, best-run artifacts, and standard plots.
-- Treat feasibility and sensitivity work as first-class outcomes, not just debugging.
+### Completed exploratory phase
+- Treat the exploratory **180 s / 240 s / 360 s** studies as completed background work.
+- Use the saved study outputs and diagnostics for interpretation, not as a prompt to build another short-window study campaign.
+- If an old exploratory result is revisited, do it only to extract a comparison or initialize the next full-process formulation.
 
 ### Article-oriented interpretation
 - Focus on comparisons that help the article:
-  - feasible versus infeasible trajectories
-  - sensitivity to initialization and constraints
-  - cryostage-model adequacy
-  - front-tracking behaviour
-  - robustness of the best runs
+  - short-window exploratory results versus full-process behaviour
+  - cryostage-model adequacy for the full-freezing phase
+  - front-position behaviour up to total solidification
+  - robustness of the final full-process optimum
 - Prefer concise tables and plots with critical interpretation over large volumes of output.
 
-## Known checks before new studies
-- Check whether the default `theta0` is already sitting on the active upper bound. In the canonical optimization runner, `DEFAULT_THETA0 = (0.0, 0.0, -6.0, -12.0, -18.0)` and the active upper bound is `0.0`, so the first entries are already bound-active.
-- Check whether the characterization glob and path logic matches the actual folder names under `data/characterization_cryostage/`. The current glob in `cryostage_model.default_characterization_run_paths()` uses `characterization_min*/cryostage_characterization_min*.csv`, while the repository folders are named `characterizations_min5`, `characterizations_min10`, `characterizations_min15`, and `characterizations_min20`.
-- Check how `T_plate0_C` is initialized in the cascade. In `open_loop_cascade.run_open_loop_case()`, if `T_plate0_C` is left as `None`, it falls back to `bcs.T_room_C` when available, otherwise to `T_ref_C[0]`. Keep that initialization consistent when comparing studies and post-processing `T_plate(t)`.
+## Known checks before the next phase
+- Check the existing freeze-stop path before adding new logic. In `solver.py`, `FreezeStopOptions(mode="fillable_region")` already writes `freeze_complete_flag` and stops when the water-filled region is fully frozen.
+- Check how `T_plate0_C` is initialized in the cascade. In `open_loop_cascade.run_open_loop_case()`, if `T_plate0_C` is left as `None`, it falls back to `bcs.T_room_C` when available, otherwise to `T_ref_C[0]`. Keep that initialization consistent when comparing legacy exploratory runs and future full-freezing runs.
+- Check whether a requested change genuinely needs new orchestration. `run_open_loop_optimization.py` and `run_open_loop_study.py` are working baselines; extend them only if the full-process formulation truly requires it.
 
 ## File and naming preferences
 - Reuse existing naming patterns where possible.
@@ -127,6 +130,7 @@ There is already a study runner producing:
   - `open_loop_optimizer.py`
   - `run_open_loop_optimization.py`
   - `run_open_loop_study.py`
+  - `run_optimizer_learning_diagnostics.py`
 - If the repository already has a better-fitting location or name, prefer that over creating parallel structures.
 
 ## Validation expectations
@@ -155,6 +159,7 @@ Good smoke tests include:
 - Do not add unnecessary abstraction layers.
 - Do not refactor unless a real blocking issue is confirmed.
 - Do not optimize against direct front-velocity noise.
+- Do not reopen the project as another round of exploratory short-window studies unless explicitly asked.
 
 ## Preferred output style when responding
 When asked to implement code:
