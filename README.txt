@@ -43,6 +43,7 @@ Open_loop
 |
 |-- code_simulation
 |   |
+|   |-- analyze_step_response_reachability.py
 |   |-- cryostage_model.py
 |   |-- front_tracking.py
 |   |-- geometry.py
@@ -50,13 +51,16 @@ Open_loop
 |   |-- open_loop_cascade.py
 |   |-- open_loop_optimizer.py
 |   |-- open_loop_problem.py
+|   |-- reachability_constraints.py
 |   |-- run_calibration_fixed_h.py
 |   |-- run_open_loop_optimization.py
 |   |-- run_open_loop_study.py
 |   |-- run_optimizer_learning_diagnostics.py
+|   |-- run_reachability_diagnostics.py
 |   |-- solver.py
 |   |-- trajectory_profiles.py
 |   |-- results
+|       |-- characterization_constraints
 |       |-- cryostage_model_validation
 |       |-- open_loop_optimization
 |       |-- open_loop_study
@@ -91,7 +95,10 @@ Additional contents:
 - figures
   Contains saved figures for the characterized temperature responses.
 - plot_characterization_assays.py
-  Script used to process and visualize the characterization assays.
+  Script used to process and visualize the raw characterization assays.
+
+The Stage 1 characterization-analysis script now lives at `code_simulation/analyze_step_response_reachability.py`.
+Its centralized outputs, together with the Stage 2 admissibility diagnostics, now live under `code_simulation/results/characterization_constraints/`.
 
 This dataset is intended to support the identification of a reduced cryostage response model that maps:
 

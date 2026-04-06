@@ -10,6 +10,11 @@ import numpy as np
 
 from cryostage_model import CryostageModelParams
 from open_loop_cascade import OpenLoopCascadeResult, run_open_loop_case
+from reachability_constraints import (
+    TrajectoryAdmissibilityError,
+    TrajectoryAdmissibilityReport,
+    check_piecewise_linear_trajectory_admissibility,
+)
 from trajectory_profiles import PiecewiseLinearTemperatureProfile
 
 
@@ -56,6 +61,8 @@ class OpenLoopProblemConfig:
     t_ignore_s: float = 0.0
     T_ref_bounds_C: tuple[float, float] = (-25.0, 25.0)
     require_monotone_nonincreasing: bool = True
+    enforce_characterization_admissibility: bool = False
+    characterization_constraints_dir: str | Path | None = None
     solver_kwargs: dict[str, Any] = field(default_factory=dict)
     front_reference_mode: str = "legacy_linear_speed"
     front_reference_alpha: float = 4.0
@@ -72,6 +79,12 @@ class OpenLoopProblemConfig:
         t_ignore_s = float(self.t_ignore_s)
         knot_times_s = _coerce_float_tuple(self.knot_times_s, name="knot_times_s")
         T_ref_bounds_C = _coerce_float_tuple(self.T_ref_bounds_C, name="T_ref_bounds_C")
+        enforce_characterization_admissibility = bool(self.enforce_characterization_admissibility)
+        characterization_constraints_dir = (
+            None
+            if self.characterization_constraints_dir is None
+            else Path(self.characterization_constraints_dir)
+        )
         solver_kwargs = dict(self.solver_kwargs)
         front_reference_mode = str(self.front_reference_mode)
         front_reference_alpha = float(self.front_reference_alpha)
@@ -130,6 +143,8 @@ class OpenLoopProblemConfig:
         object.__setattr__(self, "t_ignore_s", t_ignore_s)
         object.__setattr__(self, "knot_times_s", knot_times_s)
         object.__setattr__(self, "T_ref_bounds_C", T_ref_bounds_C)
+        object.__setattr__(self, "enforce_characterization_admissibility", enforce_characterization_admissibility)
+        object.__setattr__(self, "characterization_constraints_dir", characterization_constraints_dir)
         object.__setattr__(self, "solver_kwargs", solver_kwargs)
         object.__setattr__(self, "front_reference_mode", front_reference_mode)
         object.__setattr__(self, "front_reference_alpha", front_reference_alpha)
@@ -234,6 +249,24 @@ class OpenLoopObjectiveResult:
         return float(self.objective_value)
 
 
+def validate_theta_reachability_admissibility(
+    theta_values: tuple[float, ...],
+    config: OpenLoopProblemConfig,
+) -> TrajectoryAdmissibilityReport | None:
+    if not config.enforce_characterization_admissibility:
+        return None
+
+    report = check_piecewise_linear_trajectory_admissibility(
+        config.knot_times_s,
+        theta_values,
+        constraints_dir=config.characterization_constraints_dir,
+        require_monotone_nonincreasing=config.require_monotone_nonincreasing,
+    )
+    if not report.is_admissible:
+        raise TrajectoryAdmissibilityError(report)
+    return report
+
+
 def build_reference_profile_from_theta(
     theta,
     config: OpenLoopProblemConfig,
@@ -253,7 +286,9 @@ def build_reference_profile_from_theta(
                 f"({T_min_C:.6g}, {T_max_C:.6g})"
             )
 
-    if config.require_monotone_nonincreasing:
+    if config.enforce_characterization_admissibility:
+        validate_theta_reachability_admissibility(theta_values, config)
+    elif config.require_monotone_nonincreasing:
         for i in range(1, len(theta_values)):
             if theta_values[i] > theta_values[i - 1] + 1e-12:
                 raise ValueError("theta must be monotone non-increasing when requested")
@@ -591,4 +626,5 @@ __all__ = [
     "build_saturating_front_reference",
     "evaluate_open_loop_objective",
     "load_front_csv",
+    "validate_theta_reachability_admissibility",
 ]
