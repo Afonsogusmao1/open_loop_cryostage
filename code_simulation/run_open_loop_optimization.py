@@ -13,7 +13,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cryostage_model import DEFAULT_CRYOSTAGE_PARAMS
+from cryostage_model import DEFAULT_CRYOSTAGE_PARAMS, simulate_plate_temperature
 from geometry import GeometryParams
 from open_loop_bayesian_optimizer import BayesianOptimizationConfig, bayes_opt_runtime_details
 from open_loop_optimizer import OpenLoopOptimizationResult, optimize_open_loop_theta
@@ -36,6 +36,10 @@ DEFAULT_REQUIRE_MONOTONE_NONINCREASING = True
 DEFAULT_THETA0 = (-0.1, -5.5, -11.9, -17.0, -17.2)
 DEFAULT_CHARACTERIZATION_CONSTRAINTS_DIR = default_constraints_dir(Path(__file__).resolve().parent)
 DEFAULT_INFEASIBLE_OBJECTIVE_PENALTY = 1.0e6
+DEFAULT_KNOT_TIME_SCHEDULE = "uniform"
+SUPPORTED_KNOT_TIME_SCHEDULES = ("uniform", "early_dense", "mid_dense", "late_dense", "custom")
+EARLY_LATE_DENSE_POWER = 1.5
+MID_DENSE_POWER = 2.0
 
 
 def _configure_matplotlib() -> None:
@@ -60,6 +64,129 @@ def _uniform_knot_times_s(*, horizon_s: float, num_knots: int) -> tuple[float, .
     knot_times_s = [float(i * step_s) for i in range(num_knots - 1)]
     knot_times_s.append(horizon_s)
     return tuple(knot_times_s)
+
+
+def _validated_normalized_support_tau(
+    values,
+    *,
+    num_knots: int,
+    name: str,
+) -> tuple[float, ...]:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 1 or arr.size != int(num_knots):
+        raise ValueError(f"{name} must contain exactly {int(num_knots)} values")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values")
+    if np.any(arr < -1.0e-12) or np.any(arr > 1.0 + 1.0e-12):
+        raise ValueError(f"{name} must stay within [0, 1]")
+    arr = np.clip(arr, 0.0, 1.0)
+    if abs(float(arr[0])) > 1.0e-12 or abs(float(arr[-1]) - 1.0) > 1.0e-12:
+        raise ValueError(f"{name} must start at 0 and end at 1")
+    if np.any(np.diff(arr) <= 1.0e-12):
+        raise ValueError(f"{name} must be strictly increasing")
+    return tuple(float(value) for value in arr)
+
+
+def _parse_normalized_support_tau_arg(raw_support_tau: str | None, *, num_knots: int) -> tuple[float, ...] | None:
+    if raw_support_tau is None:
+        return None
+    parts = [part.strip() for part in str(raw_support_tau).split(",")]
+    if len(parts) != int(num_knots):
+        raise ValueError(
+            "--knot-time-custom-support-tau must contain exactly one normalized support time per knot "
+            f"({int(num_knots)} expected, got {len(parts)})"
+        )
+    return _validated_normalized_support_tau(
+        [float(part) for part in parts],
+        num_knots=int(num_knots),
+        name="knot_time_custom_support_tau",
+    )
+
+
+def _parse_normalized_support_tau_by_n_arg(raw_support_map: str | None) -> dict[int, tuple[float, ...]]:
+    if raw_support_map is None:
+        return {}
+    resolved: dict[int, tuple[float, ...]] = {}
+    entries = [entry.strip() for entry in str(raw_support_map).split(";") if entry.strip()]
+    if not entries:
+        raise ValueError("--custom-support-by-n must contain at least one N:support-list entry when provided")
+    for entry in entries:
+        if ":" not in entry:
+            raise ValueError(
+                "Each --custom-support-by-n entry must be written as 'N:t0,t1,...,tN', for example '3:0,0.35,1'"
+            )
+        n_text, support_text = entry.split(":", 1)
+        num_knots = int(n_text.strip())
+        support_parts = [part.strip() for part in support_text.split(",") if part.strip()]
+        support_tau = _validated_normalized_support_tau(
+            [float(part) for part in support_parts],
+            num_knots=num_knots,
+            name=f"custom support for N={num_knots}",
+        )
+        resolved[num_knots] = support_tau
+    return resolved
+
+
+def build_knot_time_normalized_support_tau(
+    *,
+    num_knots: int,
+    knot_time_schedule: str = DEFAULT_KNOT_TIME_SCHEDULE,
+    knot_time_custom_support_tau: tuple[float, ...] | None = None,
+) -> tuple[float, ...]:
+    num_knots = int(num_knots)
+    schedule = str(knot_time_schedule).strip().lower()
+    if schedule not in SUPPORTED_KNOT_TIME_SCHEDULES:
+        raise ValueError(
+            f"Unsupported knot_time_schedule={knot_time_schedule!r}; expected one of {SUPPORTED_KNOT_TIME_SCHEDULES!r}"
+        )
+
+    if schedule != "custom" and knot_time_custom_support_tau is not None:
+        raise ValueError("knot_time_custom_support_tau is only valid when knot_time_schedule='custom'")
+    if schedule == "custom":
+        if knot_time_custom_support_tau is None:
+            raise ValueError("knot_time_schedule='custom' requires knot_time_custom_support_tau")
+        return _validated_normalized_support_tau(
+            knot_time_custom_support_tau,
+            num_knots=num_knots,
+            name="knot_time_custom_support_tau",
+        )
+
+    uniform_tau = np.linspace(0.0, 1.0, num_knots, dtype=np.float64)
+    if schedule == "uniform":
+        support_tau = uniform_tau
+    elif schedule == "early_dense":
+        support_tau = np.power(uniform_tau, EARLY_LATE_DENSE_POWER)
+    elif schedule == "late_dense":
+        support_tau = 1.0 - np.power(1.0 - uniform_tau, EARLY_LATE_DENSE_POWER)
+    elif schedule == "mid_dense":
+        centered = 2.0 * uniform_tau - 1.0
+        support_tau = 0.5 * (1.0 + np.sign(centered) * np.power(np.abs(centered), MID_DENSE_POWER))
+        support_tau[0] = 0.0
+        support_tau[-1] = 1.0
+    else:
+        raise ValueError(f"Unsupported knot_time_schedule={knot_time_schedule!r}")
+
+    return _validated_normalized_support_tau(
+        support_tau,
+        num_knots=num_knots,
+        name=f"{schedule} normalized support",
+    )
+
+
+def build_external_knot_times_s(
+    *,
+    horizon_s: float,
+    num_knots: int,
+    knot_time_schedule: str = DEFAULT_KNOT_TIME_SCHEDULE,
+    knot_time_custom_support_tau: tuple[float, ...] | None = None,
+) -> tuple[float, ...]:
+    support_tau = build_knot_time_normalized_support_tau(
+        num_knots=int(num_knots),
+        knot_time_schedule=knot_time_schedule,
+        knot_time_custom_support_tau=knot_time_custom_support_tau,
+    )
+    horizon_s = float(horizon_s)
+    return tuple(float(horizon_s * tau_i) for tau_i in support_tau)
 
 
 def _build_legacy_problem_config() -> OpenLoopProblemConfig:
@@ -103,9 +230,19 @@ def _build_legacy_problem_config() -> OpenLoopProblemConfig:
     )
 
 
-def _build_full_process_problem_config(*, num_knots: int = len(DEFAULT_THETA0)) -> OpenLoopProblemConfig:
+def _build_full_process_problem_config(
+    *,
+    num_knots: int = len(DEFAULT_THETA0),
+    knot_time_schedule: str = DEFAULT_KNOT_TIME_SCHEDULE,
+    knot_time_custom_support_tau: tuple[float, ...] | None = None,
+) -> OpenLoopProblemConfig:
     safety_cap_s = 2400.0
-    knot_times_s = _uniform_knot_times_s(horizon_s=safety_cap_s, num_knots=num_knots)
+    knot_times_s = build_external_knot_times_s(
+        horizon_s=safety_cap_s,
+        num_knots=num_knots,
+        knot_time_schedule=knot_time_schedule,
+        knot_time_custom_support_tau=knot_time_custom_support_tau,
+    )
     return OpenLoopProblemConfig(
         horizon_s=safety_cap_s,
         cryostage_dt_s=4.0,
@@ -152,14 +289,26 @@ def _build_full_process_problem_config(*, num_knots: int = len(DEFAULT_THETA0)) 
     )
 
 
-def build_problem_config(*, formulation: str = DEFAULT_FORMULATION, num_knots: int | None = None) -> OpenLoopProblemConfig:
+def build_problem_config(
+    *,
+    formulation: str = DEFAULT_FORMULATION,
+    num_knots: int | None = None,
+    knot_time_schedule: str = DEFAULT_KNOT_TIME_SCHEDULE,
+    knot_time_custom_support_tau: tuple[float, ...] | None = None,
+) -> OpenLoopProblemConfig:
     if formulation == "legacy_exploratory":
         if num_knots not in (None, len(DEFAULT_THETA0)):
             raise ValueError("num_knots is only configurable for full_process_article")
+        if knot_time_schedule != DEFAULT_KNOT_TIME_SCHEDULE or knot_time_custom_support_tau is not None:
+            raise ValueError("knot-time schedules are only configurable for full_process_article")
         return _build_legacy_problem_config()
     if formulation == "full_process_article":
         resolved_num_knots = len(DEFAULT_THETA0) if num_knots is None else int(num_knots)
-        return _build_full_process_problem_config(num_knots=resolved_num_knots)
+        return _build_full_process_problem_config(
+            num_knots=resolved_num_knots,
+            knot_time_schedule=knot_time_schedule,
+            knot_time_custom_support_tau=knot_time_custom_support_tau,
+        )
     raise ValueError(f"Unknown formulation={formulation!r}")
 
 
@@ -188,9 +337,18 @@ def _parse_theta_arg(raw_theta: str | None, *, num_knots: int) -> tuple[float, .
     return tuple(float(value) for value in values)
 
 
-def _resolved_run_name(*, requested_run_name: str, config: OpenLoopProblemConfig, formulation: str) -> str:
+def _resolved_run_name(
+    *,
+    requested_run_name: str,
+    config: OpenLoopProblemConfig,
+    formulation: str,
+    knot_time_schedule: str,
+) -> str:
     if formulation == "full_process_article" and requested_run_name == DEFAULT_RUN_NAME:
-        return DEFAULT_RUN_NAME.replace(f"_k{len(DEFAULT_THETA0)}", f"_k{len(config.knot_times_s)}")
+        resolved = DEFAULT_RUN_NAME.replace(f"_k{len(DEFAULT_THETA0)}", f"_k{len(config.knot_times_s)}")
+        if str(knot_time_schedule) != DEFAULT_KNOT_TIME_SCHEDULE:
+            resolved += f"_sched{str(knot_time_schedule).replace('_', '')}"
+        return resolved
     return requested_run_name
 
 
@@ -302,6 +460,30 @@ def _plot_best_front_tracking(*, best_front_path: Path, config: OpenLoopProblemC
     plt.close(fig)
 
 
+def _plot_best_plate_reference_trajectory(
+    *,
+    theta_C: tuple[float, ...],
+    config: OpenLoopProblemConfig,
+    out_path: Path,
+) -> None:
+    reference_profile = build_reference_profile_from_theta(theta_C, config)
+    time_s = config.cryostage_time_grid_s()
+    T_ref_C = np.asarray([float(reference_profile(float(ti))) for ti in time_s], dtype=np.float64)
+    bcs = config.solver_kwargs.get("bcs")
+    T_plate0_C = float(bcs.T_room_C) if bcs is not None and hasattr(bcs, "T_room_C") else float(T_ref_C[0])
+    T_plate_C = simulate_plate_temperature(time_s, reference_profile, DEFAULT_CRYOSTAGE_PARAMS, T_plate0_C)
+
+    fig, ax = plt.subplots()
+    ax.plot(time_s, T_ref_C, linewidth=2.0, label=r"$T_{ref}$")
+    ax.plot(time_s, T_plate_C, linewidth=2.0, label=r"$T_{plate,model}$")
+    ax.set_title("Best-Run Plate and Reference Trajectories")
+    ax.set_xlabel("Time Since Fill (s)")
+    ax.set_ylabel("Temperature (C)")
+    ax.legend(loc="best")
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def _write_best_theta_profile_csv(out_path: Path, *, knot_times_s: tuple[float, ...], theta_C: tuple[float, ...]) -> None:
     with out_path.open("w", newline="") as f:
         writer = csv.writer(f)
@@ -317,11 +499,14 @@ def _write_best_solution_summary(
     config: OpenLoopProblemConfig,
     theta0: tuple[float, ...],
     theta_bounds_C: tuple[tuple[float, float], ...] | None,
+    knot_time_schedule: str,
+    knot_time_normalized_support_tau: tuple[float, ...],
     infeasible_objective_penalty: float,
     best_theta_profile_csv: Path,
     history_plot_path: Path,
     feasibility_plot_path: Path,
     front_plot_path: Path,
+    plate_reference_plot_path: Path,
     bo_runtime: dict[str, str] | None,
     smoke_test_note: str | None,
 ) -> None:
@@ -339,6 +524,7 @@ def _write_best_solution_summary(
         f"- Main optimizer path: `{result.method}`.",
         "- Scientific objective: unchanged front-position tracking objective from `evaluate_open_loop_objective`.",
         f"- Fixed knot count: `{len(config.knot_times_s)}` knot temperatures at externally fixed times `{list(config.knot_times_s)}`.",
+        f"- Fixed knot-time schedule: `{knot_time_schedule}` with normalized support `{list(knot_time_normalized_support_tau)}`.",
         f"- Optimized variables: knot temperatures only, with no knot-time or knot-count optimization.",
         "",
         "## Infeasible-candidate policy",
@@ -352,6 +538,7 @@ def _write_best_solution_summary(
         f"- Best theta: `{result.best_theta}`",
         f"- Best theta satisfies active constraints: `{best_theta_is_valid}`",
         f"- Active T_ref bounds: `{config.T_ref_bounds_C}`",
+        f"- Active knot times (s): `{list(config.knot_times_s)}`",
         f"- BO theta bounds: `{theta_bounds_C}`",
         f"- Evaluations: total=`{total_evaluations}`, feasible=`{feasible_evaluations}`, infeasible=`{infeasible_evaluations}`, evaluation_error=`{evaluation_errors}`, expensive_simulation_executed=`{expensive_runs}`",
         f"- Best objective value: `{result.best_objective_value:.9e}` at evaluation `{result.best_evaluation_index}`",
@@ -376,6 +563,7 @@ def _write_best_solution_summary(
             f"- Objective history plot: `{history_plot_path}`",
             f"- Feasibility timeline plot: `{feasibility_plot_path}`",
             f"- Best front tracking plot: `{front_plot_path}`",
+            f"- Best plate/reference trajectory plot: `{plate_reference_plot_path}`",
             "",
             "## Next step before the fixed-N comparison study",
             "- Keep this BO path fixed at one externally chosen knot count, then compare budgets and settings across candidate fixed-N studies only after confirming the per-run settings are scientifically acceptable.",
@@ -402,7 +590,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--num-knots",
         type=int,
         default=len(DEFAULT_THETA0),
-        help="Number of uniformly spaced T_ref knots over [0, horizon_s] for full_process_article.",
+        help="Number of externally fixed T_ref knots over [0, horizon_s] for full_process_article.",
+    )
+    parser.add_argument(
+        "--knot-time-schedule",
+        default=DEFAULT_KNOT_TIME_SCHEDULE,
+        choices=SUPPORTED_KNOT_TIME_SCHEDULES,
+        help="Externally fixed knot-time schedule family for full_process_article.",
+    )
+    parser.add_argument(
+        "--knot-time-custom-support-tau",
+        default=None,
+        help="Optional comma-separated normalized support times in [0,1] used when --knot-time-schedule=custom.",
     )
     parser.add_argument(
         "--theta0",
@@ -460,7 +659,19 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     _configure_matplotlib()
 
-    config = build_problem_config(formulation=args.formulation, num_knots=args.num_knots)
+    knot_time_custom_support_tau = _parse_normalized_support_tau_arg(
+        args.knot_time_custom_support_tau,
+        num_knots=int(args.num_knots),
+    )
+    config = build_problem_config(
+        formulation=args.formulation,
+        num_knots=args.num_knots,
+        knot_time_schedule=args.knot_time_schedule,
+        knot_time_custom_support_tau=knot_time_custom_support_tau,
+    )
+    knot_time_normalized_support_tau = tuple(
+        float(value) / float(config.horizon_s) for value in config.knot_times_s
+    )
     theta0 = _parse_theta_arg(args.theta0, num_knots=len(config.knot_times_s))
     if theta0 is None:
         theta0 = _default_theta0_for_config(config)
@@ -468,6 +679,7 @@ def main(argv: list[str] | None = None) -> None:
         requested_run_name=args.run_name,
         config=config,
         formulation=args.formulation,
+        knot_time_schedule=args.knot_time_schedule,
     )
     out_root_dir = Path(args.out_root_dir)
     run_dir = out_root_dir / run_name
@@ -507,6 +719,8 @@ def main(argv: list[str] | None = None) -> None:
     if config.enforce_characterization_admissibility:
         print(f"Characterization constraints dir = {config.characterization_constraints_dir}")
     print(f"Safety cap (horizon_s) = {config.safety_cap_s:.1f} s")
+    print(f"Knot-time schedule = {args.knot_time_schedule}")
+    print(f"Normalized knot support = {knot_time_normalized_support_tau}")
     print(f"Control knot times = {config.knot_times_s}")
     print(f"Initial theta = {theta0}")
     print(f"BO theta bounds = {bayesopt_config.theta_bounds_C}")
@@ -558,6 +772,7 @@ def main(argv: list[str] | None = None) -> None:
     history_plot_path = analysis_dir / "objective_history.png"
     feasibility_plot_path = analysis_dir / "feasible_vs_infeasible.png"
     front_plot_path = analysis_dir / "best_front_tracking.png"
+    plate_reference_plot_path = analysis_dir / "plate_reference_trajectory.png"
     best_theta_profile_csv = result.run_dir / "best_theta_profile.csv"
     best_summary_md = result.run_dir / "best_solution_summary.md"
     run_settings_json = result.run_dir / "run_settings.json"
@@ -565,6 +780,7 @@ def main(argv: list[str] | None = None) -> None:
     _plot_objective_history(result, history_plot_path)
     _plot_feasibility_timeline(result, feasibility_plot_path)
     _plot_best_front_tracking(best_front_path=best_front_path, config=config, out_path=front_plot_path)
+    _plot_best_plate_reference_trajectory(theta_C=result.best_theta, config=config, out_path=plate_reference_plot_path)
     _write_best_theta_profile_csv(best_theta_profile_csv, knot_times_s=config.knot_times_s, theta_C=result.best_theta)
 
     bo_runtime = bayes_opt_runtime_details() if str(result.method) == "bayesian-optimization" else None
@@ -574,11 +790,14 @@ def main(argv: list[str] | None = None) -> None:
         config=config,
         theta0=theta0,
         theta_bounds_C=bayesopt_config.theta_bounds_C,
+        knot_time_schedule=args.knot_time_schedule,
+        knot_time_normalized_support_tau=knot_time_normalized_support_tau,
         infeasible_objective_penalty=float(args.infeasible_objective_penalty),
         best_theta_profile_csv=best_theta_profile_csv,
         history_plot_path=history_plot_path,
         feasibility_plot_path=feasibility_plot_path,
         front_plot_path=front_plot_path,
+        plate_reference_plot_path=plate_reference_plot_path,
         bo_runtime=bo_runtime,
         smoke_test_note=args.smoke_test_note,
     )
@@ -589,6 +808,9 @@ def main(argv: list[str] | None = None) -> None:
                 "method": result.method,
                 "formulation": args.formulation,
                 "num_knots": len(config.knot_times_s),
+                "knot_time_schedule": str(args.knot_time_schedule),
+                "knot_time_custom_support_tau": None if knot_time_custom_support_tau is None else [float(value) for value in knot_time_custom_support_tau],
+                "knot_time_normalized_support_tau": [float(value) for value in knot_time_normalized_support_tau],
                 "knot_times_s": [float(value) for value in config.knot_times_s],
                 "initial_theta": [float(value) for value in theta0],
                 "theta_bounds_C": bayesopt_config.theta_bounds_C,
@@ -610,6 +832,7 @@ def main(argv: list[str] | None = None) -> None:
                     "objective_history_plot": str(history_plot_path.resolve()),
                     "feasibility_plot": str(feasibility_plot_path.resolve()),
                     "front_tracking_plot": str(front_plot_path.resolve()),
+                    "plate_reference_trajectory_plot": str(plate_reference_plot_path.resolve()),
                 },
             },
             indent=2,
@@ -638,6 +861,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Evaluation history: {result.history_csv_path}")
     print(f"Best run folder: {result.best_dir}")
     print(f"Best theta profile CSV: {best_theta_profile_csv}")
+    print(f"Best plate/reference plot: {plate_reference_plot_path}")
     print(f"Best solution summary: {best_summary_md}")
     print(f"Run settings JSON: {run_settings_json}")
     print(f"Analysis folder: {analysis_dir}")

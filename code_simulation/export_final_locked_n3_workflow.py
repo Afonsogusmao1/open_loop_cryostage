@@ -194,6 +194,8 @@ def _write_final_solution_summary(
         f"- Locked source run: `{source_run_dir}`",
         f"- Selected evaluation: `{evaluation_metadata['case_name']}` (evaluation `{evaluation_metadata['evaluation_index']}`)",
         f"- Selected knot count: `{run_settings['num_knots']}`",
+        f"- Fixed knot-time schedule: `{run_settings.get('knot_time_schedule', 'uniform')}`",
+        f"- Normalized support: `{run_settings.get('knot_time_normalized_support_tau', [])}`",
         f"- Knot times: `{knot_times_s}`",
         f"- Selected theta: `{selected_theta_C}`",
         f"- Best objective value: `{float(evaluation_metadata['objective_value']):.9e}`",
@@ -229,6 +231,7 @@ def _write_workflow_summary(
         "",
         "## Chosen workflow",
         "- Final chosen knot count: `N = 3`.",
+        f"- Fixed knot-time schedule: `{run_settings.get('knot_time_schedule', 'uniform')}` with normalized support `{run_settings.get('knot_time_normalized_support_tau', [])}`.",
         f"- Locked source run: `{source_run_dir}`.",
         f"- Final artifact bundle: `{out_dir}`.",
         "- Scientific objective: unchanged front-position tracking objective from the existing expensive evaluator.",
@@ -285,7 +288,15 @@ def main(argv: list[str] | None = None) -> None:
     front_csv_src = source_run_dir / "best" / f"{evaluation_metadata['case_name']}_front.csv"
     objective_summary = _read_key_value_text(objective_summary_src)
 
-    config = build_problem_config(formulation=str(run_settings["formulation"]), num_knots=int(run_settings["num_knots"]))
+    custom_support_tau = run_settings.get("knot_time_custom_support_tau")
+    if custom_support_tau is not None:
+        custom_support_tau = tuple(float(value) for value in custom_support_tau)
+    config = build_problem_config(
+        formulation=str(run_settings["formulation"]),
+        num_knots=int(run_settings["num_knots"]),
+        knot_time_schedule=str(run_settings.get("knot_time_schedule", "uniform")),
+        knot_time_custom_support_tau=custom_support_tau,
+    )
     reference_profile = build_reference_profile_from_theta(theta_C, config)
     admissibility_report = check_piecewise_linear_trajectory_admissibility(
         knot_times_s,

@@ -1,170 +1,56 @@
-# AGENTS.md — Open_loop project
+# AGENTS.md
 
 ## Scope
-This repository maintains an **offline open-loop trajectory design workflow** for controlling freezing-front evolution in a cryostage system.
-The modular workflow already exists, and future work should start from the **current implementation state**, not from the original implementation roadmap.
-The exploratory **180 s / 240 s / 360 s** studies should be treated as completed scoping work.
-The work must stay aligned with the current article-oriented objective: move the existing cascade toward **full freezing / total solidification** while preserving physically plausible cryostage trajectories and article-useful front-behaviour interpretation.
+This repository is scientific software for offline open-loop cryostage trajectory design. The active implementation lives in [code_simulation](/home/fenics/shared/Open_loop/code_simulation), while [data](/home/fenics/shared/Open_loop/data) contains experimental inputs, characterization material, and validation references that should be treated as source data rather than casual edit targets.
 
-## Core control assumptions — do not violate
-1. This is **open-loop trajectory control**, not real-time closed-loop front control.
-2. The optimization objective is based on **front position tracking**, not direct raw front-velocity control.
-3. The manipulated variable is the **cryostage reference temperature trajectory** `T_ref(t)`.
-4. The cryostage already has an **inner PID**. Do not replace it.
-5. The freezing simulation must receive the **actual plate or base trajectory** `T_plate(t)`, not `T_ref(t)` directly.
-6. The intended cascade is:
-   `theta -> T_ref(t) -> cryostage model -> T_plate(t) -> solver -> z_front(t) -> J(theta)`
-7. Do not bypass the cryostage model.
-8. Do not optimize against noisy instantaneous front velocity.
+## Active workflow facts
+- The active open-loop workflow is BO-based.
+- The workflow objective remains model-based open-loop design of a plate-temperature reference trajectory for the inner PID, to obtain approximately linear freezing-front progression.
+- The outer design variables are knot temperatures `theta`; the existing inner PID tracking layer is not replaced or re-optimized.
+- The intended cascade remains `theta -> T_ref(t) -> cryostage model / inner PID response -> T_plate(t) -> freezing solver -> z_front(t) -> J(theta)`.
+- Knot times are externally fixed by the chosen formulation, knot count, and external schedule. The active workflow does not optimize knot times.
+- The current default external knot-time schedule for ongoing comparisons is `uniform`.
+- The locked `N=3` bundle is now a reproducible historical reference, not a current authoritative baseline in a strong scientific sense.
+- For ongoing engineering workflow use, describe `uniform + N=3` as the pragmatic working default.
+- Describe `uniform + N=4` as the current unresolved challenger or exploratory candidate.
+- Do not document or imply that knot count is scientifically settled.
+- Warming is not currently supported. Do not silently assume admissible warming segments.
 
-## Repository context
-The workspace has two major areas:
-- `code_simulation/`
-  - active implementation area for the open-loop workflow
-  - this is where future code edits should normally happen
-  - the current modular pipeline and study runners already live here
-- `data/`
-  - experimental and reference material around the project
-  - includes cryostage characterization results, firmware and material related to characterization, experimental freezing readings, calibrated simulation outputs, and comparison material against real cryostage and freezing results
+## Active admissibility policy
+- Active admissibility is applied before the expensive freezing simulation is launched.
+- The admissibility stack combines characterization-derived transient admissibility, long-duration hold admissibility derived from freezing-run plate telemetry, and early rejection of infeasible candidates.
+- In the active BO workflow, infeasible candidates receive the configured deterministic penalty objective and are logged without running the expensive cascade.
 
-Treat `code_simulation/` as the main implementation area.
-Treat `data/` as reference input, validation material, and historical output. Do not casually rewrite it.
+## Status-defining studies
+- External schedule sensitivity: `code_simulation/results/open_loop_bayesian_optimization/schedule_sensitivity_first_pass_n3_n4/`
+  - Result: the `N=3` versus `N=4` ranking is schedule-dependent.
+  - Consequence: `uniform` is now the default external knot-time schedule for ongoing comparisons.
+- Uniform multiseed confirmation: `code_simulation/results/open_loop_bayesian_optimization/uniform_confirmation_n3_n4_multiseed_seed17/`, `..._seed29/`, and `..._seed41/`
+  - Result: `N=3` is more stable across seeds; `N=4` has upside but higher optimizer sensitivity and no robust superiority.
+  - Consequence: model order remains unresolved under the default `uniform` schedule.
 
-## Current defaults to assume unless a task says otherwise
-- active code lives under `Open_loop/code_simulation`
-- `T_ref_bounds_C = (-20.0, 0.0)`
-- `require_monotone_nonincreasing = True`
-- `T_fill_C = 12.5`
-- `h_top = 2.0`
-- `h_side = 2.0`
+## Current workflow labels to preserve
+- Historical reference workflow: `code_simulation/results/open_loop_final_workflow/locked_n3_seed29_init4_iter8/`
+- Current default external schedule: `uniform`
+- Pragmatic working default: `uniform + N=3`
+- Unresolved challenger: `uniform + N=4`
+- Scientific status: knot count unresolved under the current workflow
 
-## Development philosophy
-- Make the **minimum clean modifications necessary**.
-- Preserve the existing architecture and naming style whenever possible.
-- Keep backward compatibility with the current fixed-temperature workflow.
-- Prefer **small modular additions** over large rewrites.
-- Use **small prompts**, **small diffs**, and **separate chats** for separate questions whenever possible.
-- Work phase by phase. Do not try to re-architect the whole workflow in one pass unless explicitly asked.
-- If the codebase already partially supports a requested feature, extend it rather than re-implementing it.
-- Do **not** refactor unless a real blocking issue is confirmed.
+## Authoritative entry points
+- Single fixed-`N` BO run: [code_simulation/run_open_loop_optimization.py](/home/fenics/shared/Open_loop/code_simulation/run_open_loop_optimization.py)
+- Current schedule/model-order comparison study: [code_simulation/run_open_loop_schedule_sensitivity_study.py](/home/fenics/shared/Open_loop/code_simulation/run_open_loop_schedule_sensitivity_study.py)
+- Admissibility diagnostics: [code_simulation/run_reachability_diagnostics.py](/home/fenics/shared/Open_loop/code_simulation/run_reachability_diagnostics.py)
+- Historical locked workflow export: [code_simulation/export_final_locked_n3_workflow.py](/home/fenics/shared/Open_loop/code_simulation/export_final_locked_n3_workflow.py)
+- Current workflow note: [code_simulation/CURRENT_WORKFLOW.md](/home/fenics/shared/Open_loop/code_simulation/CURRENT_WORKFLOW.md)
+- Results index: [RESULTS_INDEX.md](/home/fenics/shared/Open_loop/RESULTS_INDEX.md)
+- Decision/status memo: [DECISION_STATUS_MEMO.md](/home/fenics/shared/Open_loop/DECISION_STATUS_MEMO.md)
 
-## Mandatory workflow for code tasks
-For any nontrivial implementation task:
-1. Inspect the relevant existing files first.
-2. Confirm the current implementation state and identify only **real blockers**.
-3. Summarize the minimum file or function changes required.
-4. Implement only the requested phase.
-5. Run or define at least one small smoke test when code changes are made.
-6. Compare outputs critically instead of assuming a run is correct because it completed.
-7. Summarize the diff clearly.
+## Active versus legacy
+- Treat the BO-based `full_process_article` path as active.
+- Treat [code_simulation/run_open_loop_fixed_n_bo_study.py](/home/fenics/shared/Open_loop/code_simulation/run_open_loop_fixed_n_bo_study.py) as earlier fixed-`N` study support, not as the current default comparison workflow.
+- Treat [code_simulation/run_open_loop_study.py](/home/fenics/shared/Open_loop/code_simulation/run_open_loop_study.py) and [code_simulation/run_optimizer_learning_diagnostics.py](/home/fenics/shared/Open_loop/code_simulation/run_optimizer_learning_diagnostics.py) as legacy or exploratory support for older study campaigns, not as the current authoritative optimization workflow.
+- Historical study folders under `code_simulation/results/open_loop_study/` and older non-BO optimization folders under `code_simulation/results/open_loop_optimization/` remain useful for context, but they are not the current baseline.
 
-## Current implementation state
-The modular open-loop workflow is already implemented.
-The active pipeline is:
-`theta -> T_ref(t) -> cryostage model -> T_plate(t) -> solver -> z_front(t) -> J(theta)`
-
-There is already a study runner producing:
-- run summaries
-- evaluation history
-- best-run artifacts
-- standard plots for `T_ref(t)`, `T_plate(t)`, front tracking, and optimization history
-
-Treat the exploratory **180 s / 240 s / 360 s** phase as complete.
-The next article-facing phase is **not** another short-window exploratory study; it is a **single full-process open-loop optimization** that runs from fill through solver-detected freeze completion.
-
-## Current technical priorities
-1. Inspect the current implementation before proposing changes.
-2. Identify only real blockers in the existing workflow.
-3. Use the solver's existing **freeze-complete** logic for the next full-freezing phase instead of inventing a separate completion criterion.
-4. Formulate the next control problem as **one full-process open-loop optimization**, not as more exploratory short-horizon studies.
-5. Keep the objective based on **front-position behaviour** and reference-tracking-style interpretation, not direct raw front-velocity control.
-6. Validate the cryostage reduced model only to the extent needed to support the full-freezing phase and article interpretation.
-7. Do new architecture work only if a real blocking issue is confirmed.
-
-## Guidance for current work
-
-### Implementation checks first
-- Start with the current entry points and active modules:
-  - `run_open_loop_optimization.py`
-  - `run_open_loop_study.py`
-  - `run_optimizer_learning_diagnostics.py`
-  - `open_loop_problem.py`
-  - `open_loop_cascade.py`
-  - `cryostage_model.py`
-- Assume the pipeline exists unless inspection shows a real gap.
-- Prefer inspecting current behaviour over proposing new abstractions.
-
-### Cryostage reduced-model validation
-- Treat reduced-model validation as an active priority, not as future architecture work.
-- Compare measured and simulated `T_plate(t)` carefully.
-- Check whether the simplest current model is adequate before proposing a more complex one.
-- Use data-path and folder-name checks before concluding that the model itself is wrong.
-
-### Completed exploratory phase
-- Treat the exploratory **180 s / 240 s / 360 s** studies as completed background work.
-- Use the saved study outputs and diagnostics for interpretation, not as a prompt to build another short-window study campaign.
-- If an old exploratory result is revisited, do it only to extract a comparison or initialize the next full-process formulation.
-
-### Article-oriented interpretation
-- Focus on comparisons that help the article:
-  - short-window exploratory results versus full-process behaviour
-  - cryostage-model adequacy for the full-freezing phase
-  - front-position behaviour up to total solidification
-  - robustness of the final full-process optimum
-- Prefer concise tables and plots with critical interpretation over large volumes of output.
-
-## Known checks before the next phase
-- Check the existing freeze-stop path before adding new logic. In `solver.py`, `FreezeStopOptions(mode="fillable_region")` already writes `freeze_complete_flag` and stops when the water-filled region is fully frozen.
-- Check how `T_plate0_C` is initialized in the cascade. In `open_loop_cascade.run_open_loop_case()`, if `T_plate0_C` is left as `None`, it falls back to `bcs.T_room_C` when available, otherwise to `T_ref_C[0]`. Keep that initialization consistent when comparing legacy exploratory runs and future full-freezing runs.
-- Check whether a requested change genuinely needs new orchestration. `run_open_loop_optimization.py` and `run_open_loop_study.py` are working baselines; extend them only if the full-process formulation truly requires it.
-
-## File and naming preferences
-- Reuse existing naming patterns where possible.
-- Add new files only if clearly useful.
-- Prefer the current implementation locations over creating parallel structures.
-- Active files already include:
-  - `cryostage_model.py`
-  - `trajectory_profiles.py`
-  - `open_loop_cascade.py`
-  - `open_loop_problem.py`
-  - `open_loop_optimizer.py`
-  - `run_open_loop_optimization.py`
-  - `run_open_loop_study.py`
-  - `run_optimizer_learning_diagnostics.py`
-- If the repository already has a better-fitting location or name, prefer that over creating parallel structures.
-
-## Validation expectations
-Every important edit should preserve the following:
-1. The existing open-loop pipeline still runs end to end.
-2. The existing fixed-temperature solver still works.
-3. Existing calibration scripts such as `run_calibration_fixed_h.py` remain usable.
-4. Study runs still produce summaries, history, best-run artifacts, and standard plots.
-5. Front extraction and post-processing continue to work with the current path.
-
-## Testing guidance
-Always define or run at least one fast smoke test.
-Good smoke tests include:
-- a very short optimization or study run with tight iteration limits
-- a comparison between two small runs that differ in one controlled setting
-- a tiny cryostage model simulation against one characterization CSV
-- a quick validation that the expected summary, history, and plot artifacts are produced
-
-## Prohibited behaviour
-- Do not redesign the entire project.
-- Do not treat the workflow as if it still needs to be built from scratch.
-- Do not introduce real-time control.
-- Do not feed `T_ref` directly into the freezing solver.
-- Do not replace the current front-tracking logic unless explicitly asked.
-- Do not replace the solver formulation unless explicitly asked.
-- Do not add unnecessary abstraction layers.
-- Do not refactor unless a real blocking issue is confirmed.
-- Do not optimize against direct front-velocity noise.
-- Do not reopen the project as another round of exploratory short-window studies unless explicitly asked.
-
-## Preferred output style when responding
-When asked to implement code:
-- be concrete
-- show touched files
-- explain only what is necessary
-- summarize the diff clearly
-Avoid long essays.
+## Current methodological caveats
+- The main unresolved methodological question is whether the externally fixed knot-time schedule is too crude.
+- The current unresolved model-order question is whether `N=4` can show robust superiority over `N=3` under the default `uniform` schedule with stronger optimization evidence.
