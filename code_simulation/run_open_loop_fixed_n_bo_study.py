@@ -16,16 +16,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from open_loop_bayesian_optimizer import bayes_opt_runtime_details
+from open_loop_workflow_config import build_problem_config, default_theta0_for_config
 from reachability_constraints import (
     conservative_settling_time_s,
     default_constraints_dir,
     load_reachability_constraints,
 )
-from run_open_loop_optimization import (
-    _default_theta0_for_config,
-    build_problem_config,
-    main as run_open_loop_optimization_main,
-)
+from run_open_loop_optimization import main as run_open_loop_optimization_main
 
 
 DEFAULT_STUDY_NAME = "fixed_n_bo_comparison_full_process_seed17_init4_iter8"
@@ -137,7 +134,7 @@ def _theta_bounds_arg(theta_bounds_C: tuple[tuple[float, float], ...]) -> str:
 
 def _seed_theta_for_run(num_knots: int, theta_bounds_C: tuple[tuple[float, float], ...]) -> tuple[float, ...]:
     config = build_problem_config(formulation=DEFAULT_FORMULATION, num_knots=int(num_knots))
-    theta0 = np.asarray(_default_theta0_for_config(config), dtype=np.float64)
+    theta0 = np.asarray(default_theta0_for_config(config), dtype=np.float64)
     lower = np.asarray([pair[0] for pair in theta_bounds_C], dtype=np.float64)
     upper = np.asarray([pair[1] for pair in theta_bounds_C], dtype=np.float64)
     seeded = np.clip(theta0, lower, upper)

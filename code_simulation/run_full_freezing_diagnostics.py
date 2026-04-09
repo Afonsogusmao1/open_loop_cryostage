@@ -14,7 +14,7 @@ import numpy as np
 
 from cryostage_model import CryostageModelParams, DEFAULT_CRYOSTAGE_PARAMS
 from open_loop_cascade import run_open_loop_case
-from run_open_loop_optimization import build_problem_config
+from open_loop_workflow_config import build_problem_config
 from solver import FreezeStopOptions, PhaseChangeParams
 from trajectory_profiles import ConstantTemperatureProfile, PiecewiseLinearTemperatureProfile
 

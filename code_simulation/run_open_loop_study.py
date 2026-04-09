@@ -18,7 +18,7 @@ import numpy as np
 from cryostage_model import DEFAULT_CRYOSTAGE_PARAMS, simulate_plate_temperature
 from open_loop_optimizer import OpenLoopOptimizationResult, optimize_open_loop_theta
 from open_loop_problem import build_front_reference, build_reference_profile_from_theta, load_front_csv
-from run_open_loop_optimization import DEFAULT_THETA0, build_problem_config
+from open_loop_workflow_config import DEFAULT_THETA0, build_problem_config
 
 
 DEFAULT_STUDY_NAME = "canonical_h240_k6_nm"

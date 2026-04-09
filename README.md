@@ -42,6 +42,7 @@ The outer BO layer designs the reference trajectory. The inner PID tracking laye
 
 ## Where to look next
 - Current workflow note: [code_simulation/CURRENT_WORKFLOW.md](/home/fenics/shared/Open_loop/code_simulation/CURRENT_WORKFLOW.md)
+- Code map: [code_simulation/CODEBASE_MAP.md](/home/fenics/shared/Open_loop/code_simulation/CODEBASE_MAP.md)
 - Results index: [RESULTS_INDEX.md](/home/fenics/shared/Open_loop/RESULTS_INDEX.md)
 - Decision/status memo: [DECISION_STATUS_MEMO.md](/home/fenics/shared/Open_loop/DECISION_STATUS_MEMO.md)
 - Agent guidance: [AGENTS.md](/home/fenics/shared/Open_loop/AGENTS.md)

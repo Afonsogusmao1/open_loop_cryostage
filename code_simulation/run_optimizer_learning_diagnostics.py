@@ -16,7 +16,7 @@ import numpy as np
 
 from cryostage_model import DEFAULT_CRYOSTAGE_PARAMS, simulate_plate_temperature
 from open_loop_problem import build_reference_profile_from_theta, load_front_csv
-from run_open_loop_optimization import build_problem_config
+from open_loop_workflow_config import build_problem_config
 
 
 def _configure_matplotlib() -> None:

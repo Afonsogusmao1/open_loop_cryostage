@@ -15,19 +15,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from open_loop_workflow_config import (
+    SUPPORTED_KNOT_TIME_SCHEDULES,
+    build_problem_config,
+    default_theta0_for_config,
+    parse_normalized_support_tau_by_n_arg,
+)
 from open_loop_bayesian_optimizer import bayes_opt_runtime_details
 from reachability_constraints import (
     conservative_settling_time_s,
     default_constraints_dir,
     load_reachability_constraints,
 )
-from run_open_loop_optimization import (
-    SUPPORTED_KNOT_TIME_SCHEDULES,
-    _default_theta0_for_config,
-    _parse_normalized_support_tau_by_n_arg,
-    build_problem_config,
-    main as run_open_loop_optimization_main,
-)
+from run_open_loop_optimization import main as run_open_loop_optimization_main
 
 
 DEFAULT_STUDY_NAME = "schedule_sensitivity_full_process_seed17_init4_iter8"
@@ -148,7 +148,7 @@ def _theta_bounds_arg(theta_bounds_C: tuple[tuple[float, float], ...]) -> str:
 
 
 def _seed_theta_for_run(config, theta_bounds_C: tuple[tuple[float, float], ...]) -> tuple[float, ...]:
-    theta0 = np.asarray(_default_theta0_for_config(config), dtype=np.float64)
+    theta0 = np.asarray(default_theta0_for_config(config), dtype=np.float64)
     lower = np.asarray([pair[0] for pair in theta_bounds_C], dtype=np.float64)
     upper = np.asarray([pair[1] for pair in theta_bounds_C], dtype=np.float64)
     seeded = np.clip(theta0, lower, upper)
@@ -779,7 +779,7 @@ def main(argv: list[str] | None = None) -> None:
 
     n_values = _parse_n_values(args.n_values)
     schedule_families = _parse_schedule_families(args.schedule_families)
-    custom_support_by_n = _parse_normalized_support_tau_by_n_arg(args.custom_support_by_n)
+    custom_support_by_n = parse_normalized_support_tau_by_n_arg(args.custom_support_by_n)
     if "custom" in schedule_families:
         missing = [num_knots for num_knots in n_values if num_knots not in custom_support_by_n]
         if missing:

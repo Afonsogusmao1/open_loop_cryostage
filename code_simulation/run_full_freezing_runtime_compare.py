@@ -16,7 +16,7 @@ from run_full_freezing_diagnostics import (
     _build_time_grid,
     _load_early_drop_case,
 )
-from run_open_loop_optimization import build_problem_config
+from open_loop_workflow_config import build_problem_config
 from solver import PhaseChangeParams, FreezeStopOptions, run_case
 
 
