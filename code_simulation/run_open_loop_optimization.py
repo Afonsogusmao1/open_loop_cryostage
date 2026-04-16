@@ -13,19 +13,22 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cryostage_model import DEFAULT_CRYOSTAGE_PARAMS, simulate_plate_temperature
+from cryostage_model import DEFAULT_CRYOSTAGE_PARAMS
+from open_loop_cascade import build_plate_temperature_response
 from open_loop_bayesian_optimizer import BayesianOptimizationConfig, bayes_opt_runtime_details
 from open_loop_optimizer import OpenLoopOptimizationResult, optimize_open_loop_theta
 from open_loop_problem import (
-    OpenLoopProblemConfig,
     build_front_reference,
     build_reference_profile_from_theta,
+    front_definition_contract_summary,
+    front_reference_contract_summary,
     load_front_csv,
 )
+from solver import SUPPORTED_FRONT_DEFINITION_MODES
 from open_loop_workflow_config import (
     DEFAULT_FORMULATION,
+    OpenLoopProblemConfig,
     DEFAULT_KNOT_TIME_SCHEDULE,
-    DEFAULT_THETA0,
     SUPPORTED_KNOT_TIME_SCHEDULES,
     build_external_knot_times_s,
     build_knot_time_normalized_support_tau,
@@ -37,8 +40,12 @@ from open_loop_workflow_config import (
 
 
 DEFAULT_METHOD = "bayesian-optimization"
-DEFAULT_RUN_NAME = "bo_full_process_k5"
+DEFAULT_RUN_NAME = "bo_full_process_active"
 DEFAULT_OUT_ROOT_DIR = Path(__file__).resolve().parent / "results" / "open_loop_bayesian_optimization"
+ACTIVE_WORKFLOW_CHAIN = (
+    "theta -> T_ref(t) -> cryostage model / inner PID response -> "
+    "T_plate(t) -> freezing solver -> z_front(t) -> J(theta)"
+)
 DEFAULT_INFEASIBLE_OBJECTIVE_PENALTY = 1.0e6
 
 
@@ -67,7 +74,7 @@ def _parse_theta_arg(raw_theta: str | None, *, num_knots: int) -> tuple[float, .
     parts = [part.strip() for part in raw_theta.split(",")]
     if len(parts) != int(num_knots):
         raise ValueError(
-            "--theta0 must contain exactly one comma-separated value per knot temperature "
+            "--theta0 must contain exactly one comma-separated value per trajectory parameter "
             f"({num_knots} expected, got {len(parts)})"
         )
     values = np.asarray([float(part) for part in parts], dtype=np.float64)
@@ -83,8 +90,8 @@ def _resolved_run_name(
     formulation: str,
     knot_time_schedule: str,
 ) -> str:
-    if formulation == "full_process_article" and requested_run_name == DEFAULT_RUN_NAME:
-        resolved = DEFAULT_RUN_NAME.replace(f"_k{len(DEFAULT_THETA0)}", f"_k{len(config.knot_times_s)}")
+    if formulation == DEFAULT_FORMULATION and requested_run_name == DEFAULT_RUN_NAME:
+        resolved = DEFAULT_RUN_NAME
         if str(knot_time_schedule) != DEFAULT_KNOT_TIME_SCHEDULE:
             resolved += f"_sched{str(knot_time_schedule).replace('_', '')}"
         return resolved
@@ -105,7 +112,7 @@ def _parse_theta_bounds_arg(raw_theta_bounds: str | None, *, num_knots: int) -> 
     raw_pairs = [part.strip() for part in raw_theta_bounds.split(",")]
     if len(raw_pairs) != int(num_knots):
         raise ValueError(
-            "--theta-bounds must contain exactly one lower:upper pair per knot temperature "
+            "--theta-bounds must contain exactly one lower:upper pair per trajectory parameter "
             f"({num_knots} expected, got {len(raw_pairs)})"
         )
     bounds: list[tuple[float, float]] = []
@@ -206,15 +213,16 @@ def _plot_best_plate_reference_trajectory(
     out_path: Path,
 ) -> None:
     reference_profile = build_reference_profile_from_theta(theta_C, config)
-    time_s = config.cryostage_time_grid_s()
-    T_ref_C = np.asarray([float(reference_profile(float(ti))) for ti in time_s], dtype=np.float64)
-    bcs = config.solver_kwargs.get("bcs")
-    T_plate0_C = float(bcs.T_room_C) if bcs is not None and hasattr(bcs, "T_room_C") else float(T_ref_C[0])
-    T_plate_C = simulate_plate_temperature(time_s, reference_profile, DEFAULT_CRYOSTAGE_PARAMS, T_plate0_C)
+    plate_response = build_plate_temperature_response(
+        time_s=config.cryostage_time_grid_s(),
+        T_ref_profile_C=reference_profile,
+        cryostage_params=DEFAULT_CRYOSTAGE_PARAMS,
+        bcs=config.solver_kwargs.get("bcs"),
+    )
 
     fig, ax = plt.subplots()
-    ax.plot(time_s, T_ref_C, linewidth=2.0, label=r"$T_{ref}$")
-    ax.plot(time_s, T_plate_C, linewidth=2.0, label=r"$T_{plate,model}$")
+    ax.plot(plate_response.cryostage_time_s, plate_response.T_ref_C, linewidth=2.0, label=r"$T_{ref}$")
+    ax.plot(plate_response.cryostage_time_s, plate_response.T_plate_C, linewidth=2.0, label=r"$T_{plate,model}$")
     ax.set_title("Best-Run Plate and Reference Trajectories")
     ax.set_xlabel("Time Since Fill (s)")
     ax.set_ylabel("Temperature (C)")
@@ -255,16 +263,19 @@ def _write_best_solution_summary(
     evaluation_errors = sum(1 for entry in result.history if entry.feasibility_status == "evaluation_error")
     expensive_runs = sum(1 for entry in result.history if entry.expensive_simulation_executed)
     best_theta_is_valid = _theta_satisfies_active_constraints(result.best_theta, config)
+    reference_contract = front_reference_contract_summary(config)
+    front_definition_contract = front_definition_contract_summary(config)
 
     lines = [
         "# Open-Loop Optimization Summary",
         "",
         "## Optimizer role",
         f"- Main optimizer path: `{result.method}`.",
+        f"- Active workflow chain: `{ACTIVE_WORKFLOW_CHAIN}`.",
         "- Scientific objective: unchanged front-position tracking objective from `evaluate_open_loop_objective`.",
-        f"- Fixed knot count: `{len(config.knot_times_s)}` knot temperatures at externally fixed times `{list(config.knot_times_s)}`.",
-        f"- Fixed knot-time schedule: `{knot_time_schedule}` with normalized support `{list(knot_time_normalized_support_tau)}`.",
-        f"- Optimized variables: knot temperatures only, with no knot-time or knot-count optimization.",
+        f"- Trajectory parameterization: `{len(config.knot_times_s)}` temperature parameters on externally fixed support times `{list(config.knot_times_s)}`.",
+        f"- External time schedule: `{knot_time_schedule}` with normalized support `{list(knot_time_normalized_support_tau)}`.",
+        f"- Optimized variables: `theta` temperature parameters only; support times are run settings, not optimized in this runner.",
         "",
         "## Infeasible-candidate policy",
         "- Every candidate is first checked through `build_reference_profile_from_theta`, which enforces bounds, monotone cooling, and the active admissibility layer before any expensive simulation starts.",
@@ -277,7 +288,14 @@ def _write_best_solution_summary(
         f"- Best theta: `{result.best_theta}`",
         f"- Best theta satisfies active constraints: `{best_theta_is_valid}`",
         f"- Active T_ref bounds: `{config.T_ref_bounds_C}`",
-        f"- Active knot times (s): `{list(config.knot_times_s)}`",
+        f"- Active support times (s): `{list(config.knot_times_s)}`",
+        f"- Front definition mode: `{front_definition_contract['front_definition_mode']}`",
+        f"- Front threshold: `{front_definition_contract['front_threshold_C']:.9e}` C",
+        f"- Front reference mode: `{reference_contract['front_reference_mode']}`",
+        f"- H_fill_m: `{reference_contract['H_fill_m']:.9e}`",
+        f"- Target start/end/duration (s): `{reference_contract['target_start_s']:.6f}` / `{reference_contract['target_end_s']:.6f}` / `{reference_contract['target_duration_s']:.6f}`",
+        f"- Implied target front speed: `{reference_contract['implied_target_front_speed_m_per_s']:.9e}` m/s (`{1.0e3 * reference_contract['implied_target_front_speed_m_per_s']:.9e}` mm/s)",
+        f"- Objective weights: tracking=`{config.tracking_weight:.6f}`, smoothness=`{config.smoothness_weight:.6f}`, completion=`{config.completion_weight:.6f}`, terminal=`{config.terminal_weight:.6f}`",
         f"- BO theta bounds: `{theta_bounds_C}`",
         f"- Evaluations: total=`{total_evaluations}`, feasible=`{feasible_evaluations}`, infeasible=`{infeasible_evaluations}`, evaluation_error=`{evaluation_errors}`, expensive_simulation_executed=`{expensive_runs}`",
         f"- Best objective value: `{result.best_objective_value:.9e}` at evaluation `{result.best_evaluation_index}`",
@@ -304,16 +322,16 @@ def _write_best_solution_summary(
             f"- Best front tracking plot: `{front_plot_path}`",
             f"- Best plate/reference trajectory plot: `{plate_reference_plot_path}`",
             "",
-            "## Next step before the fixed-N comparison study",
-            "- Keep this BO path fixed at one externally chosen knot count, then compare budgets and settings across candidate fixed-N studies only after confirming the per-run settings are scientifically acceptable.",
+            "## Methodological status",
+            "- This run records one executable BO trajectory-design setting. A single run does not close the trajectory-parameterization question; use the Phase 5 binary parameterization study runner for carry-forward evidence.",
         ]
     )
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a reproducible open-loop optimization.")
-    parser.add_argument("--run-name", default=DEFAULT_RUN_NAME, help="Run folder name inside the output root.")
+    parser = argparse.ArgumentParser(description="Run the active BO-based open-loop trajectory design workflow.")
+    parser.add_argument("--run-name", default=DEFAULT_RUN_NAME, help="Run folder stem inside the output root.")
     parser.add_argument(
         "--out-root-dir",
         default=str(DEFAULT_OUT_ROOT_DIR),
@@ -326,10 +344,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Problem formulation to run.",
     )
     parser.add_argument(
+        "--front-definition-mode",
+        default=None,
+        choices=SUPPORTED_FRONT_DEFINITION_MODES,
+        help="Temperature-threshold rule used to extract z_front(t); defaults to the workflow config.",
+    )
+    parser.add_argument(
         "--num-knots",
         type=int,
-        default=len(DEFAULT_THETA0),
-        help="Number of externally fixed T_ref knots over [0, horizon_s] for full_process_article.",
+        default=None,
+        help="Runtime trajectory parameter count for T_ref on the externally fixed support; required for full_process_article.",
     )
     parser.add_argument(
         "--knot-time-schedule",
@@ -345,12 +369,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--theta0",
         default=None,
-        help="Optional comma-separated initial knot temperatures. Defaults to the canonical profile resampled to the active knot grid.",
+        help="Optional comma-separated initial theta temperatures. Defaults to the canonical seed profile resampled to the active support.",
     )
     parser.add_argument(
         "--method",
         default=DEFAULT_METHOD,
-        help="Optimizer backend. Use 'bayesian-optimization' for the new BO path or a scipy.optimize.minimize method name for the legacy path.",
+        help="Optimizer backend. The active default is 'bayesian-optimization'; scipy.optimize.minimize method names remain for legacy compatibility.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Delete the existing run folder before running.")
     parser.add_argument(
@@ -379,7 +403,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--theta-bounds",
         default=None,
-        help="Optional comma-separated lower:upper bounds for each knot temperature, for example '-0.5:0,-7:-4,-13:-10,-17:-14.5,-20:-17'.",
+        help="Optional comma-separated lower:upper bounds with one pair per trajectory parameter.",
     )
     parser.add_argument(
         "--no-seed-theta0",
@@ -398,15 +422,23 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     _configure_matplotlib()
 
-    knot_time_custom_support_tau = _parse_normalized_support_tau_arg(
-        args.knot_time_custom_support_tau,
-        num_knots=int(args.num_knots),
-    )
+    if args.formulation == DEFAULT_FORMULATION and args.num_knots is None:
+        raise ValueError("--num-knots is required for the active full_process_article workflow")
+    if args.knot_time_custom_support_tau is not None and args.num_knots is None:
+        raise ValueError("--knot-time-custom-support-tau requires an explicit --num-knots value")
+
+    knot_time_custom_support_tau = None
+    if args.knot_time_custom_support_tau is not None:
+        knot_time_custom_support_tau = _parse_normalized_support_tau_arg(
+            args.knot_time_custom_support_tau,
+            num_knots=int(args.num_knots),
+        )
     config = build_problem_config(
         formulation=args.formulation,
         num_knots=args.num_knots,
         knot_time_schedule=args.knot_time_schedule,
         knot_time_custom_support_tau=knot_time_custom_support_tau,
+        front_definition_mode=args.front_definition_mode,
     )
     knot_time_normalized_support_tau = tuple(
         float(value) / float(config.horizon_s) for value in config.knot_times_s
@@ -452,15 +484,17 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"Formulation = {args.formulation}")
     print(f"Optimizer method = {args.method}")
+    print(f"Active workflow chain = {ACTIVE_WORKFLOW_CHAIN}")
     print(f"Active T_ref bounds = {config.T_ref_bounds_C}")
     print(f"Monotonicity required = {config.require_monotone_nonincreasing}")
     print(f"Characterization admissibility enforced = {config.enforce_characterization_admissibility}")
     if config.enforce_characterization_admissibility:
         print(f"Characterization constraints dir = {config.characterization_constraints_dir}")
     print(f"Safety cap (horizon_s) = {config.safety_cap_s:.1f} s")
-    print(f"Knot-time schedule = {args.knot_time_schedule}")
-    print(f"Normalized knot support = {knot_time_normalized_support_tau}")
-    print(f"Control knot times = {config.knot_times_s}")
+    print(f"Trajectory parameter count = {len(config.knot_times_s)}")
+    print(f"External time schedule = {args.knot_time_schedule}")
+    print(f"Normalized support = {knot_time_normalized_support_tau}")
+    print(f"Control support times = {config.knot_times_s}")
     print(f"Initial theta = {theta0}")
     print(f"BO theta bounds = {bayesopt_config.theta_bounds_C}")
     print(
@@ -471,7 +505,17 @@ def main(argv: list[str] | None = None) -> None:
         f"seed_with_theta0={bayesopt_config.seed_with_theta0})"
     )
     print(f"Infeasible objective penalty = {float(args.infeasible_objective_penalty):.6g}")
+    reference_contract = front_reference_contract_summary(config)
+    front_definition_contract = front_definition_contract_summary(config)
+    print(f"Front definition mode = {front_definition_contract['front_definition_mode']}")
+    print(f"Front threshold = {front_definition_contract['front_threshold_C']:.9e} C")
     print(f"Front reference mode = {config.front_reference_mode}")
+    print(
+        "Front target "
+        f"(H_fill={reference_contract['H_fill_m']:.9e} m, "
+        f"target_end={reference_contract['target_end_s']:.3f} s, "
+        f"speed={reference_contract['implied_target_front_speed_m_per_s']:.9e} m/s)"
+    )
     print(
         "Objective weights "
         f"(tracking={config.tracking_weight:.6f}, completion={config.completion_weight:.6f}, "
@@ -523,6 +567,9 @@ def main(argv: list[str] | None = None) -> None:
     _write_best_theta_profile_csv(best_theta_profile_csv, knot_times_s=config.knot_times_s, theta_C=result.best_theta)
 
     bo_runtime = bayes_opt_runtime_details() if str(result.method) == "bayesian-optimization" else None
+    reference_contract = front_reference_contract_summary(config)
+    front_definition_contract = front_definition_contract_summary(config)
+
     _write_best_solution_summary(
         out_path=best_summary_md,
         result=result,
@@ -546,14 +593,31 @@ def main(argv: list[str] | None = None) -> None:
                 "run_name": run_name,
                 "method": result.method,
                 "formulation": args.formulation,
+                "workflow_chain": ACTIVE_WORKFLOW_CHAIN,
+                "trajectory_parameter_count": len(config.knot_times_s),
                 "num_knots": len(config.knot_times_s),
                 "knot_time_schedule": str(args.knot_time_schedule),
                 "knot_time_custom_support_tau": None if knot_time_custom_support_tau is None else [float(value) for value in knot_time_custom_support_tau],
                 "knot_time_normalized_support_tau": [float(value) for value in knot_time_normalized_support_tau],
+                "support_times_s": [float(value) for value in config.knot_times_s],
                 "knot_times_s": [float(value) for value in config.knot_times_s],
                 "initial_theta": [float(value) for value in theta0],
                 "theta_bounds_C": bayesopt_config.theta_bounds_C,
                 "infeasible_objective_penalty": float(args.infeasible_objective_penalty),
+                "front_definition_mode": front_definition_contract['front_definition_mode'],
+                "front_threshold_C": front_definition_contract['front_threshold_C'],
+                "front_definition_contract": front_definition_contract,
+                "front_reference_mode": config.front_reference_mode,
+                "H_fill_m": reference_contract["H_fill_m"],
+                "target_end_s": reference_contract["target_end_s"],
+                "implied_target_front_speed_m_per_s": reference_contract["implied_target_front_speed_m_per_s"],
+                "front_reference_contract": reference_contract,
+                "objective_weights": {
+                    "tracking_weight": config.tracking_weight,
+                    "smoothness_weight": config.smoothness_weight,
+                    "completion_weight": config.completion_weight,
+                    "terminal_weight": config.terminal_weight,
+                },
                 "bo": {
                     "random_seed": bayesopt_config.random_seed,
                     "init_points": bayesopt_config.init_points,

@@ -2,23 +2,21 @@ from __future__ import annotations
 
 import csv
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
 from cryostage_model import CryostageModelParams
 from open_loop_cascade import OpenLoopCascadeResult, run_open_loop_case
+from open_loop_workflow_config import OpenLoopProblemConfig
+from solver import FreezeStopOptions, PhaseChangeParams, front_threshold_from_mode, normalize_front_definition_mode
 from reachability_constraints import (
     TrajectoryAdmissibilityError,
     TrajectoryAdmissibilityReport,
     check_piecewise_linear_trajectory_admissibility,
 )
 from trajectory_profiles import PiecewiseLinearTemperatureProfile
-
-
-_ALLOWED_REFERENCE_MODES = {"legacy_linear_speed", "saturating_full_process"}
 
 
 def _as_float_array(values, *, name: str) -> np.ndarray:
@@ -40,132 +38,6 @@ def _coerce_float_tuple(values, *, name: str) -> tuple[float, ...]:
     if not all(math.isfinite(value) for value in out):
         raise ValueError(f"{name} must contain only finite values")
     return out
-
-
-def _validate_strictly_increasing(values: tuple[float, ...], *, name: str) -> None:
-    for i in range(1, len(values)):
-        if values[i] <= values[i - 1]:
-            raise ValueError(f"{name} must be strictly increasing")
-
-
-@dataclass(frozen=True)
-class OpenLoopProblemConfig:
-    horizon_s: float
-    cryostage_dt_s: float
-    knot_times_s: tuple[float, ...]
-    front_target_speed_m_per_s: float
-    tracking_weight: float = 1.0
-    smoothness_weight: float = 0.0
-    terminal_weight: float = 0.0
-    completion_weight: float = 0.0
-    t_ignore_s: float = 0.0
-    T_ref_bounds_C: tuple[float, float] = (-25.0, 25.0)
-    require_monotone_nonincreasing: bool = True
-    enforce_characterization_admissibility: bool = False
-    characterization_constraints_dir: str | Path | None = None
-    solver_kwargs: dict[str, Any] = field(default_factory=dict)
-    front_reference_mode: str = "legacy_linear_speed"
-    front_reference_alpha: float = 4.0
-    incomplete_penalty_value: float = 2.0
-
-    def __post_init__(self) -> None:
-        horizon_s = float(self.horizon_s)
-        cryostage_dt_s = float(self.cryostage_dt_s)
-        front_target_speed_m_per_s = float(self.front_target_speed_m_per_s)
-        tracking_weight = float(self.tracking_weight)
-        smoothness_weight = float(self.smoothness_weight)
-        terminal_weight = float(self.terminal_weight)
-        completion_weight = float(self.completion_weight)
-        t_ignore_s = float(self.t_ignore_s)
-        knot_times_s = _coerce_float_tuple(self.knot_times_s, name="knot_times_s")
-        T_ref_bounds_C = _coerce_float_tuple(self.T_ref_bounds_C, name="T_ref_bounds_C")
-        enforce_characterization_admissibility = bool(self.enforce_characterization_admissibility)
-        characterization_constraints_dir = (
-            None
-            if self.characterization_constraints_dir is None
-            else Path(self.characterization_constraints_dir)
-        )
-        solver_kwargs = dict(self.solver_kwargs)
-        front_reference_mode = str(self.front_reference_mode)
-        front_reference_alpha = float(self.front_reference_alpha)
-        incomplete_penalty_value = float(self.incomplete_penalty_value)
-
-        if not math.isfinite(horizon_s) or horizon_s <= 0.0:
-            raise ValueError("horizon_s must be a finite positive value")
-        if not math.isfinite(cryostage_dt_s) or cryostage_dt_s <= 0.0:
-            raise ValueError("cryostage_dt_s must be a finite positive value")
-        if knot_times_s[0] < 0.0:
-            raise ValueError("knot_times_s must start at or after t=0")
-        _validate_strictly_increasing(knot_times_s, name="knot_times_s")
-        if knot_times_s[-1] > horizon_s + 1e-12:
-            raise ValueError("knot_times_s must not extend beyond horizon_s")
-
-        if len(T_ref_bounds_C) != 2:
-            raise ValueError("T_ref_bounds_C must contain exactly two values")
-        if T_ref_bounds_C[0] > T_ref_bounds_C[1]:
-            raise ValueError("T_ref_bounds_C must satisfy min <= max")
-
-        if not math.isfinite(front_target_speed_m_per_s) or front_target_speed_m_per_s < 0.0:
-            raise ValueError("front_target_speed_m_per_s must be a finite non-negative value")
-        for name, value in (
-            ("tracking_weight", tracking_weight),
-            ("smoothness_weight", smoothness_weight),
-            ("terminal_weight", terminal_weight),
-            ("completion_weight", completion_weight),
-        ):
-            if not math.isfinite(value) or value < 0.0:
-                raise ValueError(f"{name} must be a finite non-negative value")
-        if not math.isfinite(t_ignore_s) or t_ignore_s < 0.0:
-            raise ValueError("t_ignore_s must be a finite non-negative value")
-
-        if front_reference_mode not in _ALLOWED_REFERENCE_MODES:
-            raise ValueError(
-                "front_reference_mode must be one of "
-                f"{sorted(_ALLOWED_REFERENCE_MODES)!r}, got {front_reference_mode!r}"
-            )
-        if not math.isfinite(front_reference_alpha) or front_reference_alpha < 0.0:
-            raise ValueError("front_reference_alpha must be a finite non-negative value")
-        if not math.isfinite(incomplete_penalty_value) or incomplete_penalty_value <= 1.0:
-            raise ValueError("incomplete_penalty_value must be a finite value greater than 1")
-
-        if "t_after_fill_s" in solver_kwargs:
-            t_after_fill_s = float(solver_kwargs["t_after_fill_s"])
-            if abs(t_after_fill_s - horizon_s) > 1e-12:
-                raise ValueError("solver_kwargs['t_after_fill_s'] must match horizon_s when provided")
-
-        object.__setattr__(self, "horizon_s", horizon_s)
-        object.__setattr__(self, "cryostage_dt_s", cryostage_dt_s)
-        object.__setattr__(self, "front_target_speed_m_per_s", front_target_speed_m_per_s)
-        object.__setattr__(self, "tracking_weight", tracking_weight)
-        object.__setattr__(self, "smoothness_weight", smoothness_weight)
-        object.__setattr__(self, "terminal_weight", terminal_weight)
-        object.__setattr__(self, "completion_weight", completion_weight)
-        object.__setattr__(self, "t_ignore_s", t_ignore_s)
-        object.__setattr__(self, "knot_times_s", knot_times_s)
-        object.__setattr__(self, "T_ref_bounds_C", T_ref_bounds_C)
-        object.__setattr__(self, "enforce_characterization_admissibility", enforce_characterization_admissibility)
-        object.__setattr__(self, "characterization_constraints_dir", characterization_constraints_dir)
-        object.__setattr__(self, "solver_kwargs", solver_kwargs)
-        object.__setattr__(self, "front_reference_mode", front_reference_mode)
-        object.__setattr__(self, "front_reference_alpha", front_reference_alpha)
-        object.__setattr__(self, "incomplete_penalty_value", incomplete_penalty_value)
-
-    @property
-    def safety_cap_s(self) -> float:
-        return float(self.horizon_s)
-
-    def cryostage_time_grid_s(self) -> np.ndarray:
-        time_s = np.arange(0.0, self.horizon_s, self.cryostage_dt_s, dtype=np.float64)
-        if time_s.size == 0 or time_s[0] > 0.0:
-            time_s = np.insert(time_s, 0, 0.0)
-        if time_s[-1] < self.horizon_s - 1e-12:
-            time_s = np.append(time_s, self.horizon_s)
-        return time_s
-
-    def cascade_run_kwargs(self) -> dict[str, Any]:
-        run_kwargs = dict(self.solver_kwargs)
-        run_kwargs.setdefault("t_after_fill_s", self.horizon_s)
-        return run_kwargs
 
 
 @dataclass(frozen=True)
@@ -248,6 +120,9 @@ class OpenLoopObjectiveResult:
     def __float__(self) -> float:
         return float(self.objective_value)
 
+class PreparedOpenLoopCandidate:
+    theta: tuple[float, ...]
+    T_ref_profile_C: PiecewiseLinearTemperatureProfile
 
 def validate_theta_reachability_admissibility(
     theta_values: tuple[float, ...],
@@ -298,6 +173,16 @@ def build_reference_profile_from_theta(
         knot_temperatures_C=theta_values,
     )
 
+def prepare_open_loop_candidate(
+    theta,
+    config: OpenLoopProblemConfig,
+) -> PreparedOpenLoopCandidate:
+    """Validate theta through the active problem path and prepare T_ref(t)."""
+    T_ref_profile_C = build_reference_profile_from_theta(theta, config)
+    return PreparedOpenLoopCandidate(
+        theta=tuple(float(value) for value in T_ref_profile_C.knot_temperatures_C),
+        T_ref_profile_C=T_ref_profile_C,
+    )
 
 def load_front_csv(front_csv_path: str | Path) -> FrontTrajectory:
     front_csv_path = Path(front_csv_path)
@@ -358,6 +243,11 @@ def load_front_csv(front_csv_path: str | Path) -> FrontTrajectory:
     )
 
 
+def load_active_front_observable(cascade_result: OpenLoopCascadeResult) -> FrontTrajectory:
+    """Load the active centerline z_front(t) observable from solver artifacts."""
+    return load_front_csv(cascade_result.front_path)
+
+
 def _config_fill_height_m(config: OpenLoopProblemConfig) -> float:
     geom = config.solver_kwargs.get("geom")
     if geom is None or not hasattr(geom, "H_fill"):
@@ -383,6 +273,32 @@ def _legacy_linear_front_reference(
 
     z_ref_m = np.full_like(time_s, np.nan, dtype=np.float64)
     z_ref_m[valid_mask] = z0_m + config.front_target_speed_m_per_s * (time_s[valid_mask] - t0_s)
+    return z_ref_m
+
+
+def build_linear_full_process_front_reference(
+    time_s,
+    config: OpenLoopProblemConfig,
+    *,
+    H_fill_m: float | None = None,
+) -> np.ndarray:
+    time_s = _as_float_array(time_s, name="time_s")
+    H_fill_m = _config_fill_height_m(config) if H_fill_m is None else float(H_fill_m)
+
+    t_start_s = float(config.t_ignore_s)
+    target_end_s = float(config.safety_cap_s)
+    if t_start_s >= target_end_s - 1e-12:
+        raise ValueError("t_ignore_s must be smaller than the target end time for linear references")
+
+    valid_mask = time_s >= t_start_s
+    if not np.any(valid_mask):
+        raise ValueError("t_ignore_s excludes all available front samples")
+
+    duration_s = target_end_s - t_start_s
+    tau = np.clip((time_s[valid_mask] - t_start_s) / duration_s, 0.0, 1.0)
+
+    z_ref_m = np.full_like(time_s, np.nan, dtype=np.float64)
+    z_ref_m[valid_mask] = H_fill_m * tau
     return z_ref_m
 
 
@@ -436,9 +352,64 @@ def build_front_reference(
 
     if config.front_reference_mode == "legacy_linear_speed":
         return _legacy_linear_front_reference(time_s, z_front_measured, config)
+    if config.front_reference_mode == "linear_full_process":
+        return build_linear_full_process_front_reference(time_s, config, H_fill_m=H_fill_m)
     if config.front_reference_mode == "saturating_full_process":
         return build_saturating_front_reference(time_s, config, H_fill_m=H_fill_m)
     raise ValueError(f"Unsupported front_reference_mode={config.front_reference_mode!r}")
+
+
+def front_reference_contract_summary(
+    config: OpenLoopProblemConfig,
+    *,
+    H_fill_m: float | None = None,
+) -> dict[str, float | str]:
+    H_fill_m = _config_fill_height_m(config) if H_fill_m is None else float(H_fill_m)
+    target_start_s = float(config.t_ignore_s)
+
+    if config.front_reference_mode in {"linear_full_process", "saturating_full_process"}:
+        target_end_s = float(config.safety_cap_s)
+        target_duration_s = target_end_s - target_start_s
+        if target_duration_s <= 0.0:
+            implied_speed_m_per_s = math.nan
+        else:
+            implied_speed_m_per_s = H_fill_m / target_duration_s
+    else:
+        target_end_s = math.nan
+        target_duration_s = math.nan
+        implied_speed_m_per_s = float(config.front_target_speed_m_per_s)
+
+    return {
+        "front_reference_mode": str(config.front_reference_mode),
+        "H_fill_m": float(H_fill_m),
+        "target_start_s": float(target_start_s),
+        "target_end_s": float(target_end_s),
+        "target_duration_s": float(target_duration_s),
+        "implied_target_front_speed_m_per_s": float(implied_speed_m_per_s),
+        "front_target_speed_m_per_s": float(config.front_target_speed_m_per_s),
+        "front_reference_alpha": float(config.front_reference_alpha),
+    }
+
+
+def front_definition_contract_summary(config: OpenLoopProblemConfig) -> dict[str, float | str]:
+    solver_kwargs = dict(config.solver_kwargs)
+    phase = solver_kwargs.get("phase", PhaseChangeParams())
+    freeze_stop = solver_kwargs.get("freeze_stop", FreezeStopOptions())
+    front_definition_mode = normalize_front_definition_mode(
+        solver_kwargs.get("front_definition_mode", "isotherm_Tf")
+    )
+    front_threshold_C = front_threshold_from_mode(
+        front_definition_mode,
+        phase=phase,
+        freeze_stop=freeze_stop,
+    )
+    return {
+        "front_definition_mode": str(front_definition_mode),
+        "front_threshold_C": float(front_threshold_C),
+        "Tf_C": float(phase.Tf),
+        "dT_mushy_C": float(phase.dT_mushy),
+        "freeze_stop_extra_subcooling_C": float(freeze_stop.extra_subcooling_C),
+    }
 
 
 def _reference_smoothness_penalty(
@@ -493,11 +464,23 @@ def _write_objective_summary(
     front_csv_path: Path,
 ) -> Path:
     summary_path = out_dir / f"{case_name}_objective_summary.txt"
+    reference_contract = front_reference_contract_summary(config, H_fill_m=H_fill_m)
+    front_definition_contract = front_definition_contract_summary(config)
     with summary_path.open("w") as f:
+        f.write(f"front_definition_mode: {front_definition_contract['front_definition_mode']}\n")
+        f.write(f"front_threshold_C: {front_definition_contract['front_threshold_C']:.9e}\n")
         f.write(f"front_reference_mode: {config.front_reference_mode}\n")
         f.write(f"safety_cap_s: {config.safety_cap_s:.6f}\n")
         f.write(f"front_reference_alpha: {config.front_reference_alpha:.6f}\n")
         f.write(f"H_fill_m: {H_fill_m:.9e}\n")
+        f.write(f"target_start_s: {reference_contract['target_start_s']:.6f}\n")
+        f.write(f"target_end_s: {reference_contract['target_end_s']:.6f}\n")
+        f.write(f"target_duration_s: {reference_contract['target_duration_s']:.6f}\n")
+        f.write(
+            "implied_target_front_speed_m_per_s: "
+            f"{reference_contract['implied_target_front_speed_m_per_s']:.9e}\n"
+        )
+        f.write(f"front_target_speed_m_per_s: {config.front_target_speed_m_per_s:.9e}\n")
         f.write(f"tracking_weight: {config.tracking_weight:.6f}\n")
         f.write(f"completion_weight: {config.completion_weight:.6f}\n")
         f.write(f"smoothness_weight: {config.smoothness_weight:.6f}\n")
@@ -522,8 +505,11 @@ def evaluate_open_loop_objective(
     *,
     T_plate0_C: float | None = None,
 ) -> OpenLoopObjectiveResult:
+    """Evaluate theta through the active chain and return scalar J(theta)."""
+    # theta -> T_ref(t)
     T_ref_profile_C = build_reference_profile_from_theta(theta, config)
 
+    # T_ref(t) -> T_plate(t) -> freezing solver artifacts
     cascade_result = run_open_loop_case(
         time_s=config.cryostage_time_grid_s(),
         T_ref_profile_C=T_ref_profile_C,
@@ -534,7 +520,8 @@ def evaluate_open_loop_objective(
         **config.cascade_run_kwargs(),
     )
 
-    front_trajectory = load_front_csv(cascade_result.front_path)
+    # solver artifact -> active observable z_front(t)
+    front_trajectory = load_active_front_observable(cascade_result)
     H_fill_m = _config_fill_height_m(config)
     z_front_reference_m = build_front_reference(
         front_trajectory.time_since_fill_s,
@@ -543,6 +530,7 @@ def evaluate_open_loop_objective(
         H_fill_m=H_fill_m,
     )
 
+    # active observable -> scalar objective J(theta)
     objective_mask = np.isfinite(z_front_reference_m)
     if not np.any(objective_mask):
         raise ValueError("objective reference does not contain any valid samples")
@@ -564,17 +552,22 @@ def evaluate_open_loop_objective(
             + config.smoothness_weight * smoothness_penalty
             + config.terminal_weight * terminal_penalty
         )
-    elif config.front_reference_mode == "saturating_full_process":
+    elif config.front_reference_mode in {"linear_full_process", "saturating_full_process"}:
         tracking_error_norm = (
             front_trajectory.z_front_m[objective_mask] - z_front_reference_m[objective_mask]
         ) / H_fill_m
         tracking_mse = float(np.mean(tracking_error_norm * tracking_error_norm))
         smoothness_penalty = _reference_smoothness_penalty(T_ref_profile_C, config)
-        completion_penalty, freeze_completion_time_s, freeze_completion_reached = _completion_penalty(
-            front_trajectory,
-            config,
-            H_fill_m=H_fill_m,
-        )
+        if config.front_reference_mode == "saturating_full_process":
+            completion_penalty, freeze_completion_time_s, freeze_completion_reached = _completion_penalty(
+                front_trajectory,
+                config,
+                H_fill_m=H_fill_m,
+            )
+        else:
+            completion_penalty = 0.0
+            freeze_completion_time_s = front_trajectory.first_freeze_completion_time_s()
+            freeze_completion_reached = math.isfinite(freeze_completion_time_s)
         terminal_penalty = 0.0
         objective_value = (
             config.tracking_weight * tracking_mse
@@ -622,9 +615,13 @@ __all__ = [
     "OpenLoopObjectiveResult",
     "OpenLoopProblemConfig",
     "build_front_reference",
+    "build_linear_full_process_front_reference",
     "build_reference_profile_from_theta",
     "build_saturating_front_reference",
     "evaluate_open_loop_objective",
+    "front_definition_contract_summary",
+    "front_reference_contract_summary",
+    "load_active_front_observable",
     "load_front_csv",
     "validate_theta_reachability_admissibility",
 ]

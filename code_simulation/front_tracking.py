@@ -4,7 +4,7 @@
 Extract freezing front position from a temperature field.
 
 This file samples temperature along specified lines or grids.
-It locates the Tf isotherm using a sign change and linear interpolation.
+It locates an explicit temperature-threshold front using a sign change and linear interpolation.
 It can return a centerline front z(t) and a near-wall front z(t).
 It can also return a curved front z_front(r, t) if requested.
 
@@ -74,18 +74,24 @@ def eval_prepared(Tfun, pts3, cells, mask, comm):
     return vals_global
 
 
-def front_from_samples(z: np.ndarray, Tz: np.ndarray, Tf: float) -> float:
+def front_from_temperature_threshold(z: np.ndarray, Tz: np.ndarray, threshold_C: float) -> float:
     """
-    Centerline front z_front where T crosses Tf (linear interpolation).
+    Front z_front where T crosses a selected temperature threshold.
+
+    The sampled line is assumed to run from the cold plate upward through the
+    fillable column. The returned front is the first transition from
+    T <= threshold_C to T > threshold_C, using linear interpolation.
+
     Convention:
-      - find first index where Tz > Tf (liquid)
+      - find first index where Tz > threshold_C (warmer/unfrozen side)
       - interpolate between it and previous
-      - if no Tz > Tf => fully frozen => z_front = z[-1]
+      - if no Tz > threshold_C => fully past threshold => z_front = z[-1]
     """
     z = np.asarray(z, dtype=np.float64)
     Tz = np.asarray(Tz, dtype=np.float64)
+    threshold_C = float(threshold_C)
 
-    idx = np.where(Tz > Tf)[0]
+    idx = np.where(Tz > threshold_C)[0]
     if len(idx) == 0:
         return float(z[-1])
 
@@ -98,5 +104,15 @@ def front_from_samples(z: np.ndarray, Tz: np.ndarray, Tf: float) -> float:
     if abs(T1 - T0) < 1e-12:
         return float(z1)
 
-    zf = z0 + (Tf - T0) * (z1 - z0) / (T1 - T0)
+    zf = z0 + (threshold_C - T0) * (z1 - z0) / (T1 - T0)
     return float(np.clip(zf, z[0], z[-1]))
+
+
+def front_from_samples(z: np.ndarray, Tz: np.ndarray, Tf: float) -> float:
+    """
+    Backward-compatible Tf-isotherm front extraction.
+
+    New code should call front_from_temperature_threshold with an explicit
+    threshold selected by the active front-definition mode.
+    """
+    return front_from_temperature_threshold(z, Tz, Tf)

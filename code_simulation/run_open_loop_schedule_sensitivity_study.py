@@ -32,7 +32,6 @@ from run_open_loop_optimization import main as run_open_loop_optimization_main
 
 DEFAULT_STUDY_NAME = "schedule_sensitivity_full_process_seed17_init4_iter8"
 DEFAULT_OUT_ROOT_DIR = Path(__file__).resolve().parent / "results" / "open_loop_bayesian_optimization"
-DEFAULT_N_VALUES = (3, 4)
 DEFAULT_SCHEDULE_FAMILIES = ("uniform", "early_dense", "mid_dense", "late_dense")
 DEFAULT_FORMULATION = "full_process_article"
 DEFAULT_RANDOM_SEED = 17
@@ -42,8 +41,9 @@ DEFAULT_ACQ_KIND = "ucb"
 DEFAULT_KAPPA = 2.0
 DEFAULT_XI = 0.0
 DEFAULT_INFEASIBLE_OBJECTIVE_PENALTY = 1.0e6
-DEFAULT_BOUND_LOWER_ANCHORS_C = (-0.5, -9.0, -15.0, -18.0, -20.0)
-DEFAULT_BOUND_UPPER_ANCHORS_C = (0.0, -3.0, -8.0, -12.0, -14.0)
+BOUND_POLICY_TEMPLATE_SUPPORT_TAU = (0.0, 0.25, 0.5, 0.75, 1.0)
+BOUND_POLICY_LOWER_TEMPERATURES_C = (-0.5, -9.0, -15.0, -18.0, -20.0)
+BOUND_POLICY_UPPER_TEMPERATURES_C = (0.0, -3.0, -8.0, -12.0, -14.0)
 POST_INITIAL_WARM_LIMIT_C = -5.0
 PLACEHOLDER_FIGURES = (
     "objective_history.png",
@@ -98,9 +98,9 @@ def _configure_matplotlib() -> None:
 def _parse_n_values(raw_n_values: str) -> tuple[int, ...]:
     values = tuple(int(part.strip()) for part in raw_n_values.split(",") if part.strip())
     if not values:
-        raise ValueError("--n-values must contain at least one knot count")
+        raise ValueError("--n-values must contain at least one trajectory parameter count")
     if any(value < 2 for value in values):
-        raise ValueError("all knot counts must be at least 2")
+        raise ValueError("all trajectory parameter counts must be at least 2")
     if len(set(values)) != len(values):
         raise ValueError("--n-values must not contain duplicates")
     return values
@@ -129,10 +129,10 @@ def _format_float_tuple(values: tuple[float, ...], *, precision: int = 3) -> str
 
 
 def _interpolated_theta_bounds_C(normalized_support_tau: tuple[float, ...]) -> tuple[tuple[float, float], ...]:
-    base_tau = np.linspace(0.0, 1.0, len(DEFAULT_BOUND_LOWER_ANCHORS_C), dtype=np.float64)
+    base_tau = np.asarray(BOUND_POLICY_TEMPLATE_SUPPORT_TAU, dtype=np.float64)
     target_tau = np.asarray(normalized_support_tau, dtype=np.float64)
-    lower = np.interp(target_tau, base_tau, np.asarray(DEFAULT_BOUND_LOWER_ANCHORS_C, dtype=np.float64))
-    upper = np.interp(target_tau, base_tau, np.asarray(DEFAULT_BOUND_UPPER_ANCHORS_C, dtype=np.float64))
+    lower = np.interp(target_tau, base_tau, np.asarray(BOUND_POLICY_LOWER_TEMPERATURES_C, dtype=np.float64))
+    upper = np.interp(target_tau, base_tau, np.asarray(BOUND_POLICY_UPPER_TEMPERATURES_C, dtype=np.float64))
     if target_tau.size > 1:
         upper[1:] = np.minimum(upper[1:], POST_INITIAL_WARM_LIMIT_C)
     bounds: list[tuple[float, float]] = []
@@ -244,22 +244,22 @@ def _write_prescreen_placeholder_run(
     _write_empty_best_theta_csv(best_theta_csv_path)
     _write_placeholder_figure(
         analysis_dir / "objective_history.png",
-        title=f"Objective History ({schedule_name}, k={len(normalized_support_tau)})",
+        title=f"Objective History ({schedule_name}, params={len(normalized_support_tau)})",
         lines=["No BO evaluations were launched.", reason],
     )
     _write_placeholder_figure(
         analysis_dir / "feasible_vs_infeasible.png",
-        title=f"Feasible vs Infeasible Suggestions ({schedule_name}, k={len(normalized_support_tau)})",
+        title=f"Feasible vs Infeasible Suggestions ({schedule_name}, params={len(normalized_support_tau)})",
         lines=["No BO evaluations were launched.", "The run was eliminated by the deterministic pre-screen."],
     )
     _write_placeholder_figure(
         analysis_dir / "best_front_tracking.png",
-        title=f"Best Front Tracking ({schedule_name}, k={len(normalized_support_tau)})",
+        title=f"Best Front Tracking ({schedule_name}, params={len(normalized_support_tau)})",
         lines=["No admissible candidate was evaluated.", "There is no best front-tracking trace for this run."],
     )
     _write_placeholder_figure(
         analysis_dir / "plate_reference_trajectory.png",
-        title=f"Plate and Reference Trajectories ({schedule_name}, k={len(normalized_support_tau)})",
+        title=f"Plate and Reference Trajectories ({schedule_name}, params={len(normalized_support_tau)})",
         lines=["No admissible candidate was evaluated.", "There is no best plate/reference trace for this run."],
     )
 
@@ -271,7 +271,7 @@ def _write_prescreen_placeholder_run(
                 "## Study status",
                 f"- Knot-time schedule: `{schedule_name}`",
                 f"- Normalized support: `{normalized_support_tau}`",
-                f"- Knot count: `{len(normalized_support_tau)}`",
+                f"- Trajectory parameter count: `{len(normalized_support_tau)}`",
                 "- Status: `pre-screened out before BO launch`",
                 f"- Reason: `{reason}`",
                 "",
@@ -293,7 +293,7 @@ def _write_prescreen_placeholder_run(
                 "",
                 f"- Schedule family: `{schedule_name}`",
                 f"- Normalized support: `{normalized_support_tau}`",
-                f"- Knot count: `{len(normalized_support_tau)}`",
+                f"- Trajectory parameter count: `{len(normalized_support_tau)}`",
                 "- Run status: `pre-screened out before BO launch`",
                 f"- Shared BO settings: `{bo_settings}`",
                 f"- Shared bound policy output: `{theta_bounds_C}`",
@@ -463,7 +463,7 @@ def _write_per_run_note(summary: ScheduleSensitivityRunSummary, *, bo_settings: 
         "",
         f"- Schedule family: `{summary.knot_time_schedule}`",
         f"- Normalized support: `{summary.knot_time_normalized_support_tau}`",
-        f"- Knot count: `{summary.num_knots}`",
+        f"- Trajectory parameter count: `{summary.num_knots}`",
         f"- Run status: `{summary.status}`",
         f"- Shared BO settings: `{bo_settings}`",
         f"- Shared bound policy output: `{summary.theta_bounds_C}`",
@@ -587,13 +587,13 @@ def _write_schedule_family_summary(
         "",
         f"Schedule family: {schedule_name}",
         "",
-        "Results by knot count:",
+        "Results by trajectory parameter count:",
     ]
     for summary in sorted(summaries, key=lambda item: item.num_knots):
         best_text = f"{summary.best_objective_value:.9e}" if math.isfinite(summary.best_objective_value) else "n/a"
         lines.extend(
             [
-                f"- N={summary.num_knots}: status={summary.status}, best={best_text}, feasible={summary.feasible_evaluations}, infeasible={summary.infeasible_evaluations}",
+                f"- theta_count={summary.num_knots}: status={summary.status}, best={best_text}, feasible={summary.feasible_evaluations}, infeasible={summary.infeasible_evaluations}",
                 f"  normalized_support_tau={summary.knot_time_normalized_support_tau}",
                 f"  theta_bounds_C={summary.theta_bounds_C}",
                 f"  run_dir={summary.run_dir}",
@@ -605,7 +605,7 @@ def _write_schedule_family_summary(
         lines.extend(
             [
                 "",
-                f"Winner: N={winner.num_knots} with best objective {winner.best_objective_value:.9e}",
+                f"Winner: theta_count={winner.num_knots} with best objective {winner.best_objective_value:.9e}",
                 f"Winning theta: {winner.best_theta_C}",
                 f"Winning run: {winner.run_dir}",
             ]
@@ -646,13 +646,13 @@ def _write_study_summary_txt(
         "",
         f"Study name: {study_name}",
         f"Schedule families: {schedule_families}",
-        f"Knot counts: {n_values}",
-        "Scientific question: does external knot-time schedule choice change the N=3 versus N=4 ranking under the same BO and admissibility policy?",
+        f"Trajectory parameter counts in this controlled comparison: {n_values}",
+        "Scientific question: under explicitly selected trajectory parameter counts, does external time-schedule choice materially change BO outcomes under the same admissibility policy?",
         "",
         "Shared policy:",
         "- Objective: unchanged front-position tracking objective from the existing expensive evaluator.",
         "- Admissibility: unchanged characterization-derived transient gating plus empirical long-duration hold support before expensive simulation.",
-        "- Optimized variables: knot temperatures only; knot times remain externally fixed per run.",
+        "- Optimized variables: theta temperature parameters only; support times remain externally fixed per run.",
         f"- BO package: bayesian-optimization {bo_runtime['package_version']} from {bo_runtime['package_path']}",
         f"- Shared BO settings: {bo_settings}",
         f"- Shared bound policy: {bound_policy_description}",
@@ -669,14 +669,14 @@ def _write_study_summary_txt(
         for summary in schedule_rows:
             best_text = f"{summary.best_objective_value:.9e}" if math.isfinite(summary.best_objective_value) else "n/a"
             lines.append(
-                f"- {schedule_name}, N={summary.num_knots}: status={summary.status}, best={best_text}, normalized_support_tau={summary.knot_time_normalized_support_tau}"
+                f"- {schedule_name}, theta_count={summary.num_knots}: status={summary.status}, best={best_text}, normalized_support_tau={summary.knot_time_normalized_support_tau}"
             )
         if winner is None:
             lines.append(f"- {schedule_name}: no completed feasible run is available")
         else:
             winning_counts[schedule_name] = winner.num_knots
             lines.append(
-                f"- {schedule_name}: winner is N={winner.num_knots} with objective {winner.best_objective_value:.9e}"
+                f"- {schedule_name}: winner uses theta_count={winner.num_knots} with objective {winner.best_objective_value:.9e}"
             )
         lines.append("")
 
@@ -684,11 +684,11 @@ def _write_study_summary_txt(
     if not winning_counts:
         overall_line = "No schedule family produced a completed feasible comparison."
     elif len(unique_winners) == 1:
-        overall_line = f"Ranking did not flip across the tested schedule families: every completed schedule family preferred N={unique_winners[0]}."
+        overall_line = f"Ranking did not flip across the tested schedule families: every completed schedule family preferred theta_count={unique_winners[0]}."
     else:
         overall_line = (
             "Ranking changed across the tested schedule families: "
-            + ", ".join(f"{schedule} -> N={n_value}" for schedule, n_value in winning_counts.items())
+            + ", ".join(f"{schedule} -> theta_count={n_value}" for schedule, n_value in winning_counts.items())
             + "."
         )
     lines.extend(["Overall reading:", f"- {overall_line}"])
@@ -707,7 +707,7 @@ def _plot_best_objective_by_schedule(path: Path, summaries: tuple[ScheduleSensit
                 if summary.knot_time_schedule == schedule_name and summary.num_knots == num_knots and math.isfinite(summary.best_objective_value)
             ]
             y_values.append(matching[0] if matching else math.nan)
-        ax.plot(x_values, np.asarray(y_values, dtype=np.float64), marker="o", linewidth=2.0, label=f"N={num_knots}")
+        ax.plot(x_values, np.asarray(y_values, dtype=np.float64), marker="o", linewidth=2.0, label=f"theta_count={num_knots}")
     ax.set_xticks(x_values, labels=list(schedule_families))
     ax.set_title("Best Objective by External Knot-Time Schedule")
     ax.set_xlabel("Schedule family")
@@ -726,7 +726,7 @@ def _plot_best_objective_by_schedule(path: Path, summaries: tuple[ScheduleSensit
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a fixed-N external knot-time schedule sensitivity study with the BO open-loop workflow."
+        description="Run controlled external time-schedule sensitivity support for the BO open-loop workflow."
     )
     parser.add_argument("--study-name", default=DEFAULT_STUDY_NAME, help="Deterministic study folder name.")
     parser.add_argument(
@@ -736,8 +736,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--n-values",
-        default=",".join(str(value) for value in DEFAULT_N_VALUES),
-        help="Comma-separated knot counts to compare.",
+        required=True,
+        help="Required comma-separated trajectory parameter counts to compare in this controlled support runner.",
     )
     parser.add_argument(
         "--schedule-families",
@@ -749,7 +749,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Optional semicolon-separated custom normalized support map used when schedule_families includes custom. "
-            "Format example: '3:0,0.35,1;4:0,0.2,0.65,1'."
+            "Format: 'count:t0,t1,...;count:t0,t1,...'."
         ),
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED, help="Shared BO random seed.")
@@ -785,7 +785,7 @@ def main(argv: list[str] | None = None) -> None:
         if missing:
             raise ValueError(
                 "schedule_families includes custom, but --custom-support-by-n does not define support times for "
-                f"N={missing}"
+                f"trajectory parameter counts {missing}"
             )
 
     bo_runtime = bayes_opt_runtime_details()
@@ -801,9 +801,10 @@ def main(argv: list[str] | None = None) -> None:
         "infeasible_objective_penalty": float(args.infeasible_objective_penalty),
     }
     bound_policy_description = (
-        "Interpolate the canonical 5-knot BO envelope anchors "
-        f"lower={DEFAULT_BOUND_LOWER_ANCHORS_C}, upper={DEFAULT_BOUND_UPPER_ANCHORS_C} over the actual normalized support times, "
-        f"then cap every post-initial knot upper bound at {POST_INITIAL_WARM_LIMIT_C:.1f} C so BO never searches warmer "
+        "Interpolate the BO envelope seed template "
+        f"support={BOUND_POLICY_TEMPLATE_SUPPORT_TAU}, lower={BOUND_POLICY_LOWER_TEMPERATURES_C}, "
+        f"upper={BOUND_POLICY_UPPER_TEMPERATURES_C} over the actual normalized support times, "
+        f"then cap every post-initial parameter upper bound at {POST_INITIAL_WARM_LIMIT_C:.1f} C so BO never searches warmer "
         "targets than the characterization-supported cold-transition range."
     )
 
@@ -836,7 +837,7 @@ def main(argv: list[str] | None = None) -> None:
             theta_bounds_C = _interpolated_theta_bounds_C(normalized_support_tau)
             seed_theta_C = _seed_theta_for_run(config, theta_bounds_C)
             run_name = (
-                f"bo_schedule_sensitivity_{schedule_name}_k{int(num_knots)}_seed{int(args.seed)}_"
+                f"bo_schedule_sensitivity_{schedule_name}_params{int(num_knots)}_seed{int(args.seed)}_"
                 f"init{int(args.init_points)}_iter{int(args.n_iter)}"
             )
             run_dir = schedule_runs_root_dir / run_name
@@ -911,6 +912,7 @@ def main(argv: list[str] | None = None) -> None:
         "study_name": args.study_name,
         "schedule_families": list(schedule_families),
         "n_values": list(n_values),
+        "scope_note": "comparison support only; the active single-run workflow is run_open_loop_optimization.py",
         "custom_support_by_n": {str(key): list(value) for key, value in custom_support_by_n.items()},
         "shared_bo_settings": bo_settings,
         "bound_policy_description": bound_policy_description,
@@ -952,7 +954,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"{schedule_name}: no completed feasible run")
             continue
         print(
-            f"{schedule_name}: winner=N={winner.num_knots}, best={winner.best_objective_value:.9e}, "
+            f"{schedule_name}: winner_theta_count={winner.num_knots}, best={winner.best_objective_value:.9e}, "
             f"support_tau={winner.knot_time_normalized_support_tau}"
         )
 

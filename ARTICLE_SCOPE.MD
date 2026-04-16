@@ -14,3 +14,12 @@ We present a model-based open-loop workflow for designing plate-temperature refe
 - that the globally optimal final parameterization has been proven
 - that all remaining uncertainty about trajectory parameterization is closed
 - that unsupported warming behavior is validated
+
+## Operational baseline for the paper
+- Workflow: BO full-process
+- Explicit cascade preserved
+- Admissibility: ON
+- Warming: not allowed / not claimed
+- External schedule family: uniform
+- Working carry-forward choice: N=3
+- Interpretation: pragmatic working default, not settled optimality

@@ -19,10 +19,10 @@ from open_loop_bayesian_optimizer import (
     run_bayesian_optimization,
 )
 from open_loop_problem import (
-    OpenLoopProblemConfig,
     build_reference_profile_from_theta,
     evaluate_open_loop_objective,
 )
+from open_loop_workflow_config import OpenLoopProblemConfig
 
 
 def _coerce_theta_tuple(values, *, name: str) -> tuple[float, ...]:
@@ -171,6 +171,7 @@ def optimize_open_loop_theta(
     infeasible_objective_penalty: float = 1.0e6,
     T_plate0_C: float | None = None,
 ) -> OpenLoopOptimizationResult:
+    """Orchestrate candidate evaluation, run folders, history, and incumbent tracking."""
     theta0 = _coerce_theta_tuple(theta0, name="theta0")
     build_reference_profile_from_theta(theta0, config)
 
@@ -345,7 +346,6 @@ def optimize_open_loop_theta(
 
 
 __all__ = [
-    "BayesianOptimizationConfig",
     "OpenLoopOptimizationHistoryEntry",
     "OpenLoopOptimizationResult",
     "optimize_open_loop_theta",

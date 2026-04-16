@@ -163,6 +163,9 @@ def default_constraints_dir(repo_root: str | Path | None = None) -> Path:
         repo_root = Path(__file__).resolve().parent
     repo_root = Path(repo_root)
     base = repo_root if repo_root.name == "code_simulation" else repo_root / "code_simulation"
+    active_dir = base / "results" / "active" / "characterization_constraints" / "stage1_reachability"
+    if active_dir.exists():
+        return active_dir
     return base / "results" / "characterization_constraints" / "stage1_reachability"
 
 

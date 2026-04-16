@@ -48,7 +48,7 @@ from geometry import (
     dof_region_masks,
     overwrite_fillable_temperature,
 )
-from front_tracking import prepare_point_eval, eval_prepared, front_from_samples
+from front_tracking import prepare_point_eval, eval_prepared, front_from_temperature_threshold
 from materials import (
     SolidProps,
     PLA_DEFAULT,
@@ -86,6 +86,43 @@ class PrefillOptions:
 class FreezeStopOptions:
     mode: str = "fillable_region"
     extra_subcooling_C: float = 0.0
+
+
+SUPPORTED_FRONT_DEFINITION_MODES = ("isotherm_Tf", "solidus", "freeze_threshold")
+_FRONT_DEFINITION_MODE_LOOKUP = {mode.lower(): mode for mode in SUPPORTED_FRONT_DEFINITION_MODES}
+
+
+def normalize_front_definition_mode(front_definition_mode: str) -> str:
+    mode_key = str(front_definition_mode).strip().lower()
+    try:
+        return _FRONT_DEFINITION_MODE_LOOKUP[mode_key]
+    except KeyError as exc:
+        raise ValueError(
+            "front_definition_mode must be one of "
+            f"{SUPPORTED_FRONT_DEFINITION_MODES!r}, got {front_definition_mode!r}"
+        ) from exc
+
+
+def front_threshold_from_mode(
+    front_definition_mode: str,
+    *,
+    phase: PhaseChangeParams,
+    freeze_stop: FreezeStopOptions,
+) -> float:
+    """Resolve the extraction threshold for a named front definition."""
+    mode = normalize_front_definition_mode(front_definition_mode)
+    if mode == "isotherm_Tf":
+        threshold_C = float(phase.Tf)
+    elif mode == "solidus":
+        threshold_C = float(phase.Tf) - 0.5 * float(phase.dT_mushy)
+    elif mode == "freeze_threshold":
+        threshold_C = float(phase.Tf) - 0.5 * float(phase.dT_mushy) - float(freeze_stop.extra_subcooling_C)
+    else:
+        raise AssertionError(f"Unhandled front_definition_mode={mode!r}")
+
+    if not np.isfinite(threshold_C):
+        raise ValueError(f"front threshold for mode {mode!r} is not finite: {threshold_C!r}")
+    return float(threshold_C)
 
 
 def _update_coefficients(
@@ -273,6 +310,9 @@ def run_case(
     # Post-fill stop
     freeze_stop: FreezeStopOptions = FreezeStopOptions(),
 
+    # Front observable definition
+    front_definition_mode: str = "isotherm_Tf",
+
     # Probes / centerline front
     probe_z_m: tuple[float, float, float] = (3e-3, 7e-3, 12e-3),
     probe_wall_inset_m: float = 0.5e-3,
@@ -449,6 +489,18 @@ def run_case(
     next_write = 0.0
 
     freeze_threshold_C = phase.Tf - 0.5 * phase.dT_mushy - freeze_stop.extra_subcooling_C
+    front_definition_mode = normalize_front_definition_mode(front_definition_mode)
+    front_threshold_C = front_threshold_from_mode(
+        front_definition_mode,
+        phase=phase,
+        freeze_stop=freeze_stop,
+    )
+
+    if show_progress and comm.rank == 0:
+        print(
+            "Front definition "
+            f"mode={front_definition_mode}, threshold={front_threshold_C:.6f} C"
+        )
 
     probe_times = deque()
     probe_values = deque()
@@ -471,6 +523,7 @@ def run_case(
             f_front = open(front_path, "w", buffering=1)
             f_front.write(
                 "time_s,time_since_fill_s,fill_flag,"
+                "front_definition_mode,front_threshold_C,"
                 "z_front_m,z_front_mm,z_front_rel_mm,v_front_mm_per_s,"
                 "z_front_wall_m,z_front_wall_mm,v_front_wall_mm_per_s,"
                 "Tmax_fillable_C,freeze_complete_flag\n"
@@ -479,7 +532,13 @@ def run_case(
             if enable_front_curve:
                 f_curve = open(front_curve_path, "w", buffering=1)
                 f_curve.write("# radii_mm: " + ",".join(f"{rr*1000.0:.6f}" for rr in r_samp) + "\n")
-                cols = ["time_s", "time_since_fill_s", "fill_flag"] + [f"z_front_r{i:03d}_mm" for i in range(len(r_samp))]
+                cols = [
+                    "time_s",
+                    "time_since_fill_s",
+                    "fill_flag",
+                    "front_definition_mode",
+                    "front_threshold_C",
+                ] + [f"z_front_r{i:03d}_mm" for i in range(len(r_samp))]
                 f_curve.write(",".join(cols) + "\n")
 
         def do_fill(current_t: float):
@@ -511,11 +570,15 @@ def run_case(
                 f_probe.write(f"{t:.6f},{t_since_fill:.6f},{temps[0]:.6f},{temps[1]:.6f},{temps[2]:.6f}\n")
             f_front.write(
                 f"{t:.6f},{t_since_fill:.6f},{float(fill.value):.1f},"
+                f"{front_definition_mode},{front_threshold_C:.9e},"
                 "nan,nan,nan,nan,nan,nan,nan,nan,0\n"
             )
             if enable_front_curve:
                 nan_line = ",".join(["nan"] * len(r_samp))
-                f_curve.write(f"{t:.6f},{t_since_fill:.6f},{float(fill.value):.1f},{nan_line}\n")
+                f_curve.write(
+                    f"{t:.6f},{t_since_fill:.6f},{float(fill.value):.1f},"
+                    f"{front_definition_mode},{front_threshold_C:.9e},{nan_line}\n"
+                )
 
         zf_prev = np.nan
         zf_wall_prev = np.nan
@@ -637,7 +700,7 @@ def run_case(
 
             if float(fill.value) > 0.5:
                 Tz = eval_prepared(T, front_pts3, front_cells, front_mask, comm_pts)
-                zf = front_from_samples(z_samp, Tz, phase.Tf)
+                zf = front_from_temperature_threshold(z_samp, Tz, front_threshold_C)
                 zf_rel = zf - geom.t_base
                 v_front = 0.0 if np.isnan(zf_prev) else (zf - zf_prev) * 1000.0 / dt
                 zf_prev = zf
@@ -648,7 +711,7 @@ def run_case(
 
             if float(fill.value) > 0.5:
                 Tzw = eval_prepared(T, wall_pts3, wall_cells, wall_mask, comm_pts)
-                zf_wall = front_from_samples(z_samp, Tzw, phase.Tf)
+                zf_wall = front_from_temperature_threshold(z_samp, Tzw, front_threshold_C)
                 v_wall = 0.0 if np.isnan(zf_wall_prev) else (zf_wall - zf_wall_prev) * 1000.0 / dt
                 zf_wall_prev = zf_wall
                 Tmax_fillable_C = _global_fillable_max_temperature(comm, T, fillable_dof)
@@ -670,7 +733,7 @@ def run_case(
 
                     zf_r_m = np.empty(len(r_samp), dtype=float)
                     for j in range(len(r_samp)):
-                        zf_r_m[j] = front_from_samples(z_samp_curve, Tcurve[j, :], phase.Tf)
+                        zf_r_m[j] = front_from_temperature_threshold(z_samp_curve, Tcurve[j, :], front_threshold_C)
                     zf_r_mm = zf_r_m * 1000.0
                     curve_written_this_step = True
 
@@ -684,6 +747,7 @@ def run_case(
                 if float(fill.value) > 0.5:
                     f_front.write(
                         f"{t:.6f},{t_since_fill:.6f},{float(fill.value):.1f},"
+                        f"{front_definition_mode},{front_threshold_C:.9e},"
                         f"{zf:.9e},{zf*1000.0:.6f},{zf_rel*1000.0:.6f},{v_front:.6f},"
                         f"{zf_wall:.9e},{zf_wall*1000.0:.6f},{v_wall:.6f},"
                         f"{Tmax_fillable_C:.6f},{freeze_complete:d}\n"
@@ -691,12 +755,14 @@ def run_case(
                 else:
                     f_front.write(
                         f"{t:.6f},{t_since_fill:.6f},{float(fill.value):.1f},"
+                        f"{front_definition_mode},{front_threshold_C:.9e},"
                         "nan,nan,nan,nan,nan,nan,nan,nan,0\n"
                     )
 
                 if enable_front_curve and curve_written_this_step:
                     f_curve.write(
                         f"{t:.6f},{t_since_fill:.6f},{float(fill.value):.1f},"
+                        f"{front_definition_mode},{front_threshold_C:.9e},"
                         + ",".join(f"{val:.6f}" for val in zf_r_mm)
                         + "\n"
                     )

@@ -27,6 +27,17 @@ def _validate_time_grid(time_s: np.ndarray) -> None:
 
 
 @dataclass(frozen=True)
+class OpenLoopPlateResponse:
+    """Sampled T_ref(t) and modeled T_plate(t) for one candidate trajectory."""
+
+    cryostage_time_s: np.ndarray
+    T_ref_C: np.ndarray
+    T_plate_C: np.ndarray
+    T_plate_profile_C: PiecewiseLinearTemperatureProfile
+    T_plate0_C: float
+
+
+@dataclass(frozen=True)
 class OpenLoopCascadeResult:
     cryostage_time_s: np.ndarray
     T_ref_C: np.ndarray
@@ -50,6 +61,53 @@ def sampled_temperature_profile(time_s, temperature_C) -> PiecewiseLinearTempera
     )
 
 
+def _resolve_initial_plate_temperature_C(
+    *,
+    T_ref_C: np.ndarray,
+    T_plate0_C: float | None,
+    bcs,
+) -> float:
+    if T_plate0_C is not None:
+        return float(T_plate0_C)
+    if bcs is not None and hasattr(bcs, "T_room_C"):
+        return float(bcs.T_room_C)
+    return float(T_ref_C[0])
+
+
+def build_plate_temperature_response(
+    *,
+    time_s,
+    T_ref_profile_C,
+    cryostage_params: CryostageModelParams,
+    T_plate0_C: float | None = None,
+    bcs=None,
+) -> OpenLoopPlateResponse:
+    """Execute theta-derived T_ref(t) through the reduced cryostage response."""
+    time_s = _as_float_array(time_s, name="time_s")
+    _validate_time_grid(time_s)
+
+    T_ref_C = np.array([float(T_ref_profile_C(float(ti))) for ti in time_s], dtype=np.float64)
+    resolved_T_plate0_C = _resolve_initial_plate_temperature_C(
+        T_ref_C=T_ref_C,
+        T_plate0_C=T_plate0_C,
+        bcs=bcs,
+    )
+    T_plate_C = simulate_plate_temperature(
+        time_s=time_s,
+        T_ref_profile_C=T_ref_profile_C,
+        params=cryostage_params,
+        T_plate0_C=resolved_T_plate0_C,
+    )
+    T_plate_profile_C = sampled_temperature_profile(time_s, T_plate_C)
+    return OpenLoopPlateResponse(
+        cryostage_time_s=time_s,
+        T_ref_C=T_ref_C,
+        T_plate_C=T_plate_C,
+        T_plate_profile_C=T_plate_profile_C,
+        T_plate0_C=float(resolved_T_plate0_C),
+    )
+
+
 def run_open_loop_case(
     *,
     time_s,
@@ -60,35 +118,24 @@ def run_open_loop_case(
     T_plate0_C: float | None = None,
     **run_case_kwargs,
 ) -> OpenLoopCascadeResult:
+    """Run T_ref(t) -> T_plate(t) -> freezing solver artifacts for one case."""
     if "T_plate_C" in run_case_kwargs or "T_plate_profile_C" in run_case_kwargs:
         raise ValueError("run_case_kwargs must not override T_plate_C or T_plate_profile_C")
 
-    time_s = _as_float_array(time_s, name="time_s")
-    _validate_time_grid(time_s)
-
-    T_ref_C = np.array([float(T_ref_profile_C(float(ti))) for ti in time_s], dtype=np.float64)
-
-    if T_plate0_C is None:
-        bcs = run_case_kwargs.get("bcs")
-        if bcs is not None and hasattr(bcs, "T_room_C"):
-            T_plate0_C = float(bcs.T_room_C)
-        else:
-            T_plate0_C = float(T_ref_C[0])
-
-    T_plate_C = simulate_plate_temperature(
+    plate_response = build_plate_temperature_response(
         time_s=time_s,
         T_ref_profile_C=T_ref_profile_C,
-        params=cryostage_params,
-        T_plate0_C=float(T_plate0_C),
+        cryostage_params=cryostage_params,
+        T_plate0_C=T_plate0_C,
+        bcs=run_case_kwargs.get("bcs"),
     )
-    T_plate_profile_C = sampled_temperature_profile(time_s, T_plate_C)
 
     out_dir = Path(out_dir)
     run_case(
         out_dir=out_dir,
         prefix=prefix,
-        T_plate_C=float(T_plate_C[0]),
-        T_plate_profile_C=T_plate_profile_C,
+        T_plate_C=float(plate_response.T_plate_C[0]),
+        T_plate_profile_C=plate_response.T_plate_profile_C,
         **run_case_kwargs,
     )
 
@@ -100,9 +147,9 @@ def run_open_loop_case(
         front_curve_path = None
 
     return OpenLoopCascadeResult(
-        cryostage_time_s=time_s,
-        T_ref_C=T_ref_C,
-        T_plate_C=T_plate_C,
+        cryostage_time_s=plate_response.cryostage_time_s,
+        T_ref_C=plate_response.T_ref_C,
+        T_plate_C=plate_response.T_plate_C,
         out_dir=out_dir,
         xdmf_path=xdmf_path,
         probes_path=probes_path,
@@ -113,6 +160,8 @@ def run_open_loop_case(
 
 __all__ = [
     "OpenLoopCascadeResult",
+    "OpenLoopPlateResponse",
+    "build_plate_temperature_response",
     "run_open_loop_case",
     "sampled_temperature_profile",
 ]
