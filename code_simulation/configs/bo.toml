@@ -1,0 +1,78 @@
+# Bayesian-optimization settings for the active velocity-control workflow.
+# Edit this file to change trajectory parameterization or BO budget without
+# modifying Python code.
+
+[trajectory]
+# Number of optimized temperature knots in theta.
+num_knots = 8
+
+# Fixed support distribution for the knots: uniform, early_dense, mid_dense,
+# late_dense, or custom.
+knot_time_schedule = "uniform"
+
+# Used only when knot_time_schedule = "custom". Values must start at 0.0,
+# end at 1.0, be strictly increasing, and contain num_knots entries.
+knot_time_custom_support_tau = []
+
+# Initial BO trajectory registered before random/acquisition suggestions when
+# seed_with_theta0 is true. The optimizer changes only these temperatures, not
+# the knot times.
+theta0_C = [-4.339973144034226, -6.439515477137384, -8.53905781024054, -10.638600143343697, -12.595795033464528, -14.410642480603028, -16.225489927741527, -18.04033737488003]
+
+# Global admissible range for every requested T_ref knot.
+T_ref_bounds_C = [-21.0, 0.0]
+
+# Optional per-knot BO bounds. Leave empty to use T_ref_bounds_C for every knot.
+# Interpolated from the anchored uniform n3 policy used as the n8 prior.
+theta_bounds_C = [[-10.0, 0.0], [-11.714285714285714, -1.7142857142857142], [-13.428571428571429, -3.428571428571429], [-15.142857142857142, -5.142857142857142], [-16.714285714285715, -6.571428571428571], [-18.142857142857142, -7.7142857142857135], [-19.57142857142857, -8.857142857142858], [-21.0, -10.0]]
+
+# Reserved for a future phase. In this first BO version, knot times are fixed by
+# knot_time_schedule/custom support and only the knot temperatures are optimized.
+optimize_knot_times = false
+
+[bayesian_optimization]
+# Random seed used by the BO backend.
+random_seed = 17
+
+# Number of initial BO suggestions after the optional seeded theta0.
+init_points = 2
+
+# Number of acquisition-guided BO suggestions.
+n_iter = 30
+
+# Acquisition function: ucb, ei, or poi.
+acquisition_kind = "ei"
+
+# Exploration parameter for UCB.
+acquisition_kappa = 2.576
+
+# Improvement margin for EI/POI.
+acquisition_xi = 0.01
+
+# Register the canonical theta0 as the first BO observation.
+seed_with_theta0 = true
+
+# Search-space parameterization: raw_theta or monotone_unit_box.
+parameterization_kind = "monotone_unit_box"
+
+# Initial BO candidate generation: uniform_random, feasible_local, or
+# feasible_local_deterministic.
+init_strategy = "feasible_local"
+
+# Typical local perturbation radius in normalized BO space.
+init_local_sigma = 0.15
+
+# Maximum number of precheck attempts per requested init point.
+init_max_attempts_per_point = 40
+
+# Optional deterministic local polish around the incumbent after the BO loop.
+# Set to 0 to disable.
+local_refinement_points = 0
+
+# Typical local perturbation radius for the post-BO local refinement in normalized
+# BO space.
+local_refinement_sigma = 0.08
+
+[objective]
+# Objective value returned when admissibility rejects a candidate before simulation.
+infeasible_objective_penalty = 1000000.0

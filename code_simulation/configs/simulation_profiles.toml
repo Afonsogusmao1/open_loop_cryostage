@@ -1,0 +1,84 @@
+# Simulation profiles for the open-loop freezing workflow.
+# Edit this file when you want to change mesh resolution, time step, front tracking,
+# output volume, or the ambient-temperature model without modifying Python code.
+
+# Profile used when --simulation-profile is not supplied.
+default_profile = "optimization"
+
+[profiles.optimization]
+# Cryostage model sampling interval used to build T_ref(t) and T_plate(t).
+cryostage_dt_s = 4.0
+
+# PDE solver time step for the freezing simulation.
+solver_dt_s = 4.0
+
+# Axisymmetric mesh resolution: radial and axial node counts.
+Nr = 36
+Nz = 72
+
+# Number of centerline samples used to locate the freezing front.
+Nz_front = 200
+
+# Curved-front sampling resolution, used only when enable_front_curve is true.
+Nr_front_curve = 25
+Nz_front_curve = 400
+
+# Large write interval and disabled heavy outputs keep BO objective evaluations light.
+write_every_s = 1000000000.0
+write_field_output = false
+write_probe_csv = false
+show_progress = false
+enable_front_curve = false
+
+# Use the tabulated water/ice thermal properties in production-style runs.
+use_tabulated_water_ice = true
+
+[profiles.optimization.ambient]
+# Interpolate ambient air temperature from the modeled plate/cryostage temperature.
+mode = "interpolate_from_cryostage"
+
+# Calibration points: plate/cryostage temperature in degrees Celsius.
+cryostage_temperature_C = [-20.0, -15.0, -10.0]
+
+# Measured ambient air temperature corresponding to each cryostage point.
+ambient_temperature_C = [5.75, 7.568, 9.7078]
+
+# Outside the measured range, use the nearest measured ambient value.
+extrapolation = "clamp"
+
+[profiles.full_process_article]
+# High-fidelity profile for final/article-style full-process simulations.
+cryostage_dt_s = 0.25
+solver_dt_s = 0.25
+
+# Fine mesh used for the article/full-process simulation pass.
+Nr = 180
+Nz = 408
+
+# Fine centerline front sampling used by the calibration/high-fidelity workflow.
+Nz_front = 800
+
+# Curved-front sampling resolution.
+Nr_front_curve = 25
+Nz_front_curve = 400
+
+# Keep output cadence moderate for high-fidelity inspection.
+write_every_s = 60.0
+write_field_output = true
+write_probe_csv = true
+show_progress = true
+enable_front_curve = true
+use_tabulated_water_ice = true
+
+[profiles.full_process_article.ambient]
+# Interpolate ambient air temperature from the modeled plate/cryostage temperature.
+mode = "interpolate_from_cryostage"
+
+# Calibration points: plate/cryostage temperature in degrees Celsius.
+cryostage_temperature_C = [-20.0, -15.0, -10.0]
+
+# Measured ambient air temperature corresponding to each cryostage point.
+ambient_temperature_C = [5.75, 7.568, 9.7078]
+
+# Outside the measured range, use the nearest measured ambient value.
+extrapolation = "clamp"

@@ -1,0 +1,63 @@
+# Velocity-control problem settings.
+# This file defines the physical control target and initial protocol shared by
+# manual evaluations and the velocity-control BO runner.
+
+[run]
+# Name used for the output directory under code_simulation/results/active/n<num_knots>/fine/.
+run_name = "fine_confirm_v0p008_n8_uniform_n3_anchor"
+
+# Simulation profile loaded from simulation_profiles.toml.
+# Use "optimization" for fast checks and "full_process_article" for final high-fidelity runs.
+simulation_profile = "optimization"
+
+[velocity_target]
+# Desired constant freezing-front speed in mm/s.
+target_front_speed_mm_s = 0.008
+
+# Evaluation window in the axial direction.
+# The direct BO objective uses a 0.5 mm margin around the thermocouple span.
+# The thermocouple-equivalent diagnostics still use the physical 3.0, 6.2, and 11.0 mm sensors.
+control_z_min_mm = 2.5
+control_z_max_mm = 11.5
+
+[initial_conditions]
+# Water temperature immediately after filling the mold.
+initial_water_temperature_C = 12.5
+
+# Initial modeled plate/base temperature at the instant cooling starts.
+initial_plate_temperature_C = 2.5
+
+# The active protocol starts directly from water in the mold and does not wait
+# for a warm stabilization hold before cooling.
+no_warm_hold = true
+
+[temperature_uncertainty]
+# Symmetric temperature margin used only when comparing requested cryostage
+# temperatures against characterization-supported targets and support bands.
+# This represents sensor/measurement uncertainty and does not expand the hard
+# physical bounds used by the BO or manual trajectory definitions.
+characterization_temperature_margin_C = 0.5
+
+[manual_trajectory]
+# Duration of the cooling trajectory after filling.
+horizon_s = 2400.0
+
+# Number of user-defined T_ref temperature knots.
+num_knots = 8
+
+# Temporal support for the knots: uniform, early_dense, mid_dense, late_dense, or custom.
+knot_time_schedule = "uniform"
+
+# Used only when knot_time_schedule = "custom".
+# Values must start at 0.0, end at 1.0, be strictly increasing, and contain num_knots entries.
+knot_time_custom_support_tau = []
+
+# Manual T_ref knot temperatures in degrees Celsius.
+# These are the values being evaluated in this phase; they are not optimized yet.
+theta_C = [-4.339973144034226, -6.439515477137384, -8.53905781024054, -10.638600143343697, -12.595795033464528, -14.410642480603028, -16.225489927741527, -18.04033737488003]
+
+# Physical bounds for cooling-phase T_ref knots.
+T_ref_bounds_C = [-21.0, 0.0]
+
+# Enforce monotone cooling in the manual trajectory.
+require_monotone_nonincreasing = true

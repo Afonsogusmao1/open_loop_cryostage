@@ -1,0 +1,867 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import shutil
+from dataclasses import replace
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+from code_simulation.core.config_files import (
+    DEFAULT_BO_CONFIG_PATH,
+    DEFAULT_SIMULATION_CONFIG_PATH,
+    load_bo_config,
+    load_simulation_profiles,
+    override_simulation_profile,
+)
+from code_simulation.core.paths import results_dir
+from code_simulation.core.plotting import configure_matplotlib
+from code_simulation.simulation.ambient import describe_ambient_temperature_model
+from code_simulation.simulation.cryostage_model import DEFAULT_CRYOSTAGE_PARAMS
+from code_simulation.simulation.open_loop_cascade import build_plate_temperature_response
+from code_simulation.optimization.open_loop_bayesian_optimizer import BayesianOptimizationConfig, bayes_opt_runtime_details
+from code_simulation.optimization.open_loop_optimizer import OpenLoopOptimizationResult, optimize_open_loop_theta
+from code_simulation.optimization.open_loop_problem import (
+    build_front_reference,
+    build_reference_profile_from_theta,
+    front_definition_contract_summary,
+    front_reference_contract_summary,
+    load_front_csv,
+)
+from code_simulation.simulation.solver import SUPPORTED_FRONT_DEFINITION_MODES
+from code_simulation.optimization.open_loop_workflow_config import (
+    DEFAULT_FORMULATION,
+    OpenLoopProblemConfig,
+    DEFAULT_KNOT_TIME_SCHEDULE,
+    SUPPORTED_KNOT_TIME_SCHEDULES,
+    apply_simulation_profile,
+    build_external_knot_times_s,
+    build_knot_time_normalized_support_tau,
+    build_problem_config,
+    default_theta0_for_config,
+    parse_normalized_support_tau_arg,
+    parse_normalized_support_tau_by_n_arg,
+)
+
+
+DEFAULT_METHOD = "bayesian-optimization"
+DEFAULT_RUN_NAME = "bo_full_process_active"
+DEFAULT_OUT_ROOT_DIR = results_dir("open_loop_bayesian_optimization")
+ACTIVE_WORKFLOW_CHAIN = (
+    "theta -> T_ref(t) -> cryostage model / inner PID response -> "
+    "T_plate(t) -> freezing solver -> z_front(t) -> J(theta)"
+)
+DEFAULT_INFEASIBLE_OBJECTIVE_PENALTY = 1.0e6
+
+
+def _configure_matplotlib() -> None:
+    configure_matplotlib(plt)
+
+
+_default_theta0_for_config = default_theta0_for_config
+_parse_normalized_support_tau_arg = parse_normalized_support_tau_arg
+_parse_normalized_support_tau_by_n_arg = parse_normalized_support_tau_by_n_arg
+
+
+def _parse_theta_arg(raw_theta: str | None, *, num_knots: int) -> tuple[float, ...] | None:
+    if raw_theta is None:
+        return None
+    parts = [part.strip() for part in raw_theta.split(",")]
+    if len(parts) != int(num_knots):
+        raise ValueError(
+            "--theta0 must contain exactly one comma-separated value per trajectory parameter "
+            f"({num_knots} expected, got {len(parts)})"
+        )
+    values = np.asarray([float(part) for part in parts], dtype=np.float64)
+    if values.ndim != 1 or values.size != int(num_knots) or not np.all(np.isfinite(values)):
+        raise ValueError("--theta0 must contain only finite 1D values")
+    return tuple(float(value) for value in values)
+
+
+def _resolved_run_name(
+    *,
+    requested_run_name: str,
+    config: OpenLoopProblemConfig,
+    formulation: str,
+    knot_time_schedule: str,
+) -> str:
+    if formulation == DEFAULT_FORMULATION and requested_run_name == DEFAULT_RUN_NAME:
+        resolved = DEFAULT_RUN_NAME
+        if str(knot_time_schedule) != DEFAULT_KNOT_TIME_SCHEDULE:
+            resolved += f"_sched{str(knot_time_schedule).replace('_', '')}"
+        return resolved
+    return requested_run_name
+
+
+def _theta_satisfies_active_constraints(theta, config: OpenLoopProblemConfig) -> bool:
+    try:
+        build_reference_profile_from_theta(theta, config)
+    except Exception:
+        return False
+    return True
+
+
+def _parse_theta_bounds_arg(raw_theta_bounds: str | None, *, num_knots: int) -> tuple[tuple[float, float], ...] | None:
+    if raw_theta_bounds is None:
+        return None
+    raw_pairs = [part.strip() for part in raw_theta_bounds.split(",")]
+    if len(raw_pairs) != int(num_knots):
+        raise ValueError(
+            "--theta-bounds must contain exactly one lower:upper pair per trajectory parameter "
+            f"({num_knots} expected, got {len(raw_pairs)})"
+        )
+    bounds: list[tuple[float, float]] = []
+    for idx, raw_pair in enumerate(raw_pairs):
+        if ":" not in raw_pair:
+            raise ValueError(f"theta bound {idx} must be written as lower:upper")
+        lower_text, upper_text = (piece.strip() for piece in raw_pair.split(":", 1))
+        lower_C = float(lower_text)
+        upper_C = float(upper_text)
+        if not (math.isfinite(lower_C) and math.isfinite(upper_C) and lower_C < upper_C):
+            raise ValueError(f"theta bound {idx} must satisfy lower < upper with finite values")
+        bounds.append((lower_C, upper_C))
+    return tuple(bounds)
+
+
+def _plot_objective_history(result: OpenLoopOptimizationResult, out_path: Path) -> None:
+    indices = np.asarray([entry.evaluation_index for entry in result.history], dtype=np.float64)
+    objective_values = np.asarray([entry.objective_value for entry in result.history], dtype=np.float64)
+    feasible_mask = np.asarray([entry.is_valid for entry in result.history], dtype=bool)
+
+    fig, ax = plt.subplots()
+    if np.any(feasible_mask):
+        ax.plot(
+            indices[feasible_mask],
+            objective_values[feasible_mask],
+            marker="o",
+            linewidth=1.5,
+            markersize=4.0,
+            color="#2A6F97",
+            label="feasible evaluations",
+        )
+    if np.any(~feasible_mask):
+        ax.scatter(
+            indices[~feasible_mask],
+            objective_values[~feasible_mask],
+            marker="x",
+            color="#C44536",
+            label="infeasible / failed",
+        )
+    ax.scatter(
+        [result.best_evaluation_index],
+        [result.best_objective_value],
+        color="#2A9D8F",
+        s=60,
+        zorder=3,
+        label="best feasible",
+    )
+    finite_values = objective_values[np.isfinite(objective_values) & (objective_values > 0.0)]
+    if finite_values.size >= 2 and float(np.max(finite_values) / np.min(finite_values)) >= 10.0:
+        ax.set_yscale("log")
+    ax.set_title("Objective History")
+    ax.set_xlabel("Evaluation Index")
+    ax.set_ylabel("Returned Objective Value")
+    ax.legend(loc="best")
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _plot_feasibility_timeline(result: OpenLoopOptimizationResult, out_path: Path) -> None:
+    status_to_y = {"evaluation_error": -1.0, "infeasible": 0.0, "feasible": 1.0}
+    status_to_color = {"evaluation_error": "#6D597A", "infeasible": "#C44536", "feasible": "#2A9D8F"}
+
+    fig, ax = plt.subplots(figsize=(8.5, 3.6))
+    for status in ("evaluation_error", "infeasible", "feasible"):
+        x_values = [entry.evaluation_index for entry in result.history if entry.feasibility_status == status]
+        y_values = [status_to_y[status]] * len(x_values)
+        if x_values:
+            ax.scatter(x_values, y_values, color=status_to_color[status], label=status, s=45)
+    ax.set_title("Feasible vs Infeasible Suggestions")
+    ax.set_xlabel("Evaluation Index")
+    ax.set_yticks([-1.0, 0.0, 1.0], labels=["evaluation_error", "infeasible", "feasible"])
+    ax.set_ylim(-1.5, 1.5)
+    ax.legend(loc="best")
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _plot_best_front_tracking(*, best_front_path: Path, config: OpenLoopProblemConfig, out_path: Path) -> None:
+    front = load_front_csv(best_front_path)
+    z_ref_m = build_front_reference(front.time_since_fill_s, front.z_front_m, config)
+    valid_mask = np.isfinite(z_ref_m)
+
+    fig, ax = plt.subplots()
+    ax.plot(front.time_since_fill_s, 1000.0 * front.z_front_m, linewidth=2.0, label=r"$z_{front}$")
+    ax.plot(front.time_since_fill_s[valid_mask], 1000.0 * z_ref_m[valid_mask], "--", linewidth=2.0, label=r"$z_{ref}$")
+    ax.set_title("Best-Run Front Tracking")
+    ax.set_xlabel("Time Since Fill (s)")
+    ax.set_ylabel("Front Position (mm)")
+    ax.legend(loc="best")
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _plot_best_plate_reference_trajectory(
+    *,
+    theta_C: tuple[float, ...],
+    config: OpenLoopProblemConfig,
+    out_path: Path,
+) -> None:
+    reference_profile = build_reference_profile_from_theta(theta_C, config)
+    plate_response = build_plate_temperature_response(
+        time_s=config.cryostage_time_grid_s(),
+        T_ref_profile_C=reference_profile,
+        cryostage_params=DEFAULT_CRYOSTAGE_PARAMS,
+        bcs=config.solver_kwargs.get("bcs"),
+    )
+
+    fig, ax = plt.subplots()
+    ax.plot(plate_response.cryostage_time_s, plate_response.T_ref_C, linewidth=2.0, label=r"$T_{ref}$")
+    ax.plot(plate_response.cryostage_time_s, plate_response.T_plate_C, linewidth=2.0, label=r"$T_{plate,model}$")
+    ax.set_title("Best-Run Plate and Reference Trajectories")
+    ax.set_xlabel("Time Since Fill (s)")
+    ax.set_ylabel("Temperature (C)")
+    ax.legend(loc="best")
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _write_best_theta_profile_csv(out_path: Path, *, knot_times_s: tuple[float, ...], theta_C: tuple[float, ...]) -> None:
+    with out_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["knot_index", "time_s", "temperature_C"])
+        for idx, (time_s, temperature_C) in enumerate(zip(knot_times_s, theta_C, strict=True)):
+            writer.writerow([idx, float(time_s), float(temperature_C)])
+
+
+def _write_best_solution_summary(
+    *,
+    out_path: Path,
+    result: OpenLoopOptimizationResult,
+    config: OpenLoopProblemConfig,
+    theta0: tuple[float, ...],
+    theta_bounds_C: tuple[tuple[float, float], ...] | None,
+    knot_time_schedule: str,
+    knot_time_normalized_support_tau: tuple[float, ...],
+    infeasible_objective_penalty: float,
+    best_theta_profile_csv: Path,
+    history_plot_path: Path,
+    feasibility_plot_path: Path,
+    front_plot_path: Path,
+    plate_reference_plot_path: Path,
+    bo_runtime: dict[str, str] | None,
+    smoke_test_note: str | None,
+) -> None:
+    total_evaluations = len(result.history)
+    feasible_evaluations = sum(1 for entry in result.history if entry.is_valid)
+    infeasible_evaluations = sum(1 for entry in result.history if entry.feasibility_status == "infeasible")
+    evaluation_errors = sum(1 for entry in result.history if entry.feasibility_status == "evaluation_error")
+    expensive_runs = sum(1 for entry in result.history if entry.expensive_simulation_executed)
+    best_theta_is_valid = _theta_satisfies_active_constraints(result.best_theta, config)
+    reference_contract = front_reference_contract_summary(config)
+    front_definition_contract = front_definition_contract_summary(config)
+
+    lines = [
+        "# Open-Loop Optimization Summary",
+        "",
+        "## Optimizer role",
+        f"- Main optimizer path: `{result.method}`.",
+        f"- Active workflow chain: `{ACTIVE_WORKFLOW_CHAIN}`.",
+        "- Scientific objective: unchanged front-position tracking objective from `evaluate_open_loop_objective`.",
+        f"- Trajectory parameterization: `{len(config.knot_times_s)}` temperature parameters on externally fixed support times `{list(config.knot_times_s)}`.",
+        f"- External time schedule: `{knot_time_schedule}` with normalized support `{list(knot_time_normalized_support_tau)}`.",
+        f"- Optimized variables: `theta` temperature parameters only; support times are run settings, not optimized in this runner.",
+        "",
+        "## Infeasible-candidate policy",
+        "- Every candidate is first checked through `build_reference_profile_from_theta`, which enforces bounds, monotone cooling, and the active admissibility layer before any expensive simulation starts.",
+        f"- If that pre-check fails, the evaluation is logged as `infeasible`, the expensive simulation is skipped, and a deterministic penalty objective of `{float(infeasible_objective_penalty):.6g}` is returned.",
+        "- Feasible candidates proceed into the expensive cascade and keep the unchanged scientific objective value.",
+        "- Any post-admissibility evaluation failure is logged separately as `evaluation_error`.",
+        "",
+        "## Run settings",
+        f"- Initial theta: `{theta0}`",
+        f"- Best theta: `{result.best_theta}`",
+        f"- Best theta satisfies active constraints: `{best_theta_is_valid}`",
+        f"- Active T_ref bounds: `{config.T_ref_bounds_C}`",
+        f"- Active support times (s): `{list(config.knot_times_s)}`",
+        f"- Front definition mode: `{front_definition_contract['front_definition_mode']}`",
+        f"- Front threshold: `{front_definition_contract['front_threshold_C']:.9e}` C",
+        f"- Front reference mode: `{reference_contract['front_reference_mode']}`",
+        f"- H_fill_m: `{reference_contract['H_fill_m']:.9e}`",
+        f"- Target start/end/duration (s): `{reference_contract['target_start_s']:.6f}` / `{reference_contract['target_end_s']:.6f}` / `{reference_contract['target_duration_s']:.6f}`",
+        f"- Implied target front speed: `{reference_contract['implied_target_front_speed_m_per_s']:.9e}` m/s (`{1.0e3 * reference_contract['implied_target_front_speed_m_per_s']:.9e}` mm/s)",
+        f"- Objective weights: tracking=`{config.tracking_weight:.6f}`, smoothness=`{config.smoothness_weight:.6f}`, completion=`{config.completion_weight:.6f}`, terminal=`{config.terminal_weight:.6f}`",
+        f"- Ambient model: `{describe_ambient_temperature_model(config.solver_kwargs.get('ambient_temperature_from_plate_C'))}`",
+        f"- BO theta bounds: `{theta_bounds_C}`",
+        f"- Evaluations: total=`{total_evaluations}`, feasible=`{feasible_evaluations}`, infeasible=`{infeasible_evaluations}`, evaluation_error=`{evaluation_errors}`, expensive_simulation_executed=`{expensive_runs}`",
+        f"- Best objective value: `{result.best_objective_value:.9e}` at evaluation `{result.best_evaluation_index}`",
+        f"- Optimizer termination: success=`{result.success}`, status=`{result.status}`, message=`{result.message}`",
+    ]
+    if bo_runtime is not None:
+        lines.extend(
+            [
+                f"- BO package: `bayesian-optimization {bo_runtime['package_version']}`",
+                f"- BO package path: `{bo_runtime['package_path']}`",
+            ]
+        )
+    if smoke_test_note:
+        lines.extend(["", "## Smoke test note", f"- {smoke_test_note}"])
+    lines.extend(
+        [
+            "",
+            "## Artifacts",
+            f"- Evaluation history CSV: `{result.history_csv_path}`",
+            f"- Best evaluation folder copy: `{result.best_dir}`",
+            f"- Best theta profile CSV: `{best_theta_profile_csv}`",
+            f"- Objective history plot: `{history_plot_path}`",
+            f"- Feasibility timeline plot: `{feasibility_plot_path}`",
+            f"- Best front tracking plot: `{front_plot_path}`",
+            f"- Best plate/reference trajectory plot: `{plate_reference_plot_path}`",
+            "",
+            "## Methodological status",
+            "- This run records one executable BO trajectory-design setting. A single run does not close the trajectory-parameterization question; use the Phase 5 binary parameterization study runner for carry-forward evidence.",
+        ]
+    )
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _effective_config_payload(
+    *,
+    args: argparse.Namespace,
+    run_name: str,
+    formulation: str,
+    method: str,
+    simulation_profile_name: str,
+    config: OpenLoopProblemConfig,
+    theta0: tuple[float, ...],
+    theta_bounds_C: tuple[tuple[float, float], ...] | None,
+    knot_time_schedule: str,
+    knot_time_normalized_support_tau: tuple[float, ...],
+    bayesopt_config: BayesianOptimizationConfig,
+    infeasible_objective_penalty: float,
+) -> dict[str, object]:
+    solver_kwargs = config.solver_kwargs
+    ambient_model = solver_kwargs.get("ambient_temperature_from_plate_C")
+    return {
+        "run_name": run_name,
+        "formulation": formulation,
+        "method": method,
+        "config_files": {
+            "simulation_config": str(Path(args.simulation_config)),
+            "bo_config": str(Path(args.bo_config)),
+        },
+        "simulation_profile": simulation_profile_name,
+        "problem": {
+            "horizon_s": float(config.horizon_s),
+            "cryostage_dt_s": float(config.cryostage_dt_s),
+            "knot_times_s": [float(value) for value in config.knot_times_s],
+            "knot_time_schedule": str(knot_time_schedule),
+            "knot_time_normalized_support_tau": [float(value) for value in knot_time_normalized_support_tau],
+            "T_ref_bounds_C": [float(value) for value in config.T_ref_bounds_C],
+            "theta0": [float(value) for value in theta0],
+            "theta_bounds_C": None
+            if theta_bounds_C is None
+            else [[float(lo), float(hi)] for lo, hi in theta_bounds_C],
+            "front_reference_mode": str(config.front_reference_mode),
+            "front_definition_mode": str(solver_kwargs.get("front_definition_mode", "isotherm_Tf")),
+        },
+        "solver": {
+            "Nr": int(solver_kwargs["Nr"]),
+            "Nz": int(solver_kwargs["Nz"]),
+            "dt": float(solver_kwargs["dt"]),
+            "Nz_front": int(solver_kwargs["Nz_front"]),
+            "Nr_front_curve": int(solver_kwargs.get("Nr_front_curve", 25)),
+            "Nz_front_curve": int(solver_kwargs.get("Nz_front_curve", 400)),
+            "write_every": float(solver_kwargs["write_every"]),
+            "write_field_output": bool(solver_kwargs.get("write_field_output", True)),
+            "write_probe_csv": bool(solver_kwargs.get("write_probe_csv", True)),
+            "show_progress": bool(solver_kwargs.get("show_progress", True)),
+            "enable_front_curve": bool(solver_kwargs.get("enable_front_curve", True)),
+            "use_tabulated_water_ice": bool(solver_kwargs.get("use_tabulated_water_ice", False)),
+            "T_fill_C": float(solver_kwargs["T_fill_C"]),
+            "T_room_C_initial_or_fallback": float(solver_kwargs["bcs"].T_room_C),
+            "h_top": float(solver_kwargs["bcs"].h_top),
+            "h_side": float(solver_kwargs["bcs"].h_side),
+            "ambient": describe_ambient_temperature_model(ambient_model),
+        },
+        "bo": {
+            "random_seed": int(bayesopt_config.random_seed),
+            "init_points": int(bayesopt_config.init_points),
+            "n_iter": int(bayesopt_config.n_iter),
+            "acquisition_kind": str(bayesopt_config.acquisition_kind),
+            "acquisition_kappa": float(bayesopt_config.acquisition_kappa),
+            "acquisition_xi": float(bayesopt_config.acquisition_xi),
+            "seed_with_theta0": bool(bayesopt_config.seed_with_theta0),
+            "infeasible_objective_penalty": float(infeasible_objective_penalty),
+        },
+    }
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the active BO-based open-loop trajectory design workflow.")
+    parser.add_argument(
+        "--simulation-config",
+        default=str(DEFAULT_SIMULATION_CONFIG_PATH),
+        help="TOML file with named simulation profiles.",
+    )
+    parser.add_argument(
+        "--simulation-profile",
+        default=None,
+        help="Simulation profile name from --simulation-config. Defaults to the TOML default_profile.",
+    )
+    parser.add_argument(
+        "--bo-config",
+        default=str(DEFAULT_BO_CONFIG_PATH),
+        help="TOML file with trajectory and BO settings.",
+    )
+    parser.add_argument(
+        "--dry-run-config",
+        action="store_true",
+        help="Print the effective configuration and exit before creating run folders or launching simulations.",
+    )
+    parser.add_argument("--run-name", default=DEFAULT_RUN_NAME, help="Run folder stem inside the output root.")
+    parser.add_argument(
+        "--out-root-dir",
+        default=str(DEFAULT_OUT_ROOT_DIR),
+        help="Root folder where optimization runs are written.",
+    )
+    parser.add_argument(
+        "--formulation",
+        default=DEFAULT_FORMULATION,
+        choices=("full_process_article", "legacy_exploratory"),
+        help="Problem formulation to run.",
+    )
+    parser.add_argument(
+        "--front-definition-mode",
+        default=None,
+        choices=SUPPORTED_FRONT_DEFINITION_MODES,
+        help="Temperature-threshold rule used to extract z_front(t); defaults to the workflow config.",
+    )
+    parser.add_argument(
+        "--num-knots",
+        type=int,
+        default=None,
+        help="Runtime trajectory parameter count for T_ref on the externally fixed support; defaults to bo.toml.",
+    )
+    parser.add_argument(
+        "--knot-time-schedule",
+        default=None,
+        choices=SUPPORTED_KNOT_TIME_SCHEDULES,
+        help="Externally fixed knot-time schedule family for full_process_article.",
+    )
+    parser.add_argument(
+        "--knot-time-custom-support-tau",
+        default=None,
+        help="Optional comma-separated normalized support times in [0,1] used when --knot-time-schedule=custom.",
+    )
+    parser.add_argument(
+        "--theta0",
+        default=None,
+        help="Optional comma-separated initial theta temperatures. Defaults to the canonical seed profile resampled to the active support.",
+    )
+    parser.add_argument(
+        "--method",
+        default=None,
+        help="Optimizer backend. The active default is 'bayesian-optimization'; scipy.optimize.minimize method names remain for legacy compatibility.",
+    )
+    parser.add_argument("--overwrite", action="store_true", help="Delete the existing run folder before running.")
+    parser.add_argument(
+        "--infeasible-objective-penalty",
+        type=float,
+        default=None,
+        help="Deterministic objective value returned when the active admissibility pre-check fails.",
+    )
+
+    parser.add_argument("--maxiter", type=int, default=None, help="Maximum optimizer iterations for the legacy scipy path.")
+    parser.add_argument("--maxfev", type=int, default=None, help="Maximum objective evaluations for the legacy scipy path.")
+    parser.add_argument("--xatol", type=float, default=None, help="Absolute theta convergence tolerance for the legacy scipy path.")
+    parser.add_argument("--fatol", type=float, default=None, help="Absolute objective convergence tolerance for the legacy scipy path.")
+
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for the BO backend.")
+    parser.add_argument("--init-points", type=int, default=None, help="Number of initial random BO suggestions.")
+    parser.add_argument("--n-iter", type=int, default=None, help="Number of BO acquisition-guided suggestions.")
+    parser.add_argument(
+        "--acq-kind",
+        default=None,
+        choices=("ucb", "ei", "poi"),
+        help="BO acquisition function kind.",
+    )
+    parser.add_argument("--kappa", type=float, default=None, help="BO acquisition kappa parameter.")
+    parser.add_argument("--xi", type=float, default=None, help="BO acquisition xi parameter.")
+    parser.add_argument(
+        "--theta-bounds",
+        default=None,
+        help="Optional comma-separated lower:upper bounds with one pair per trajectory parameter.",
+    )
+    parser.add_argument(
+        "--no-seed-theta0",
+        action="store_true",
+        help="Do not register the canonical initial theta as the first BO observation.",
+    )
+    parser.add_argument(
+        "--smoke-test-note",
+        default=None,
+        help="Optional line included in the markdown summary to document the smoke-test scope.",
+    )
+    parser.add_argument("--solver-dt-s", type=float, default=None, help="Override the selected simulation profile solver time step.")
+    parser.add_argument("--cryostage-dt-s", type=float, default=None, help="Override the selected simulation profile cryostage sampling time step.")
+    parser.add_argument("--nr", type=int, default=None, help="Override the selected simulation profile radial mesh nodes.")
+    parser.add_argument("--nz", type=int, default=None, help="Override the selected simulation profile axial mesh nodes.")
+    parser.add_argument("--nz-front", type=int, default=None, help="Override the selected simulation profile centerline front sampling nodes.")
+    parser.add_argument(
+        "--ambient-mode",
+        default=None,
+        choices=("fixed", "interpolate_from_cryostage"),
+        help="Override the selected simulation profile ambient-temperature model.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    _configure_matplotlib()
+
+    simulation_profiles = load_simulation_profiles(args.simulation_config)
+    simulation_profile_name = args.simulation_profile or simulation_profiles.default_profile
+    simulation_profile = simulation_profiles.get_profile(simulation_profile_name)
+    simulation_profile = override_simulation_profile(
+        simulation_profile,
+        cryostage_dt_s=args.cryostage_dt_s,
+        solver_dt_s=args.solver_dt_s,
+        Nr=args.nr,
+        Nz=args.nz,
+        Nz_front=args.nz_front,
+        ambient_mode=args.ambient_mode,
+    )
+    bo_file_config = load_bo_config(args.bo_config)
+
+    formulation = str(args.formulation)
+    method = DEFAULT_METHOD if args.method is None else str(args.method)
+    num_knots = int(bo_file_config.num_knots if args.num_knots is None else args.num_knots)
+    knot_time_schedule = str(
+        bo_file_config.knot_time_schedule if args.knot_time_schedule is None else args.knot_time_schedule
+    )
+    infeasible_objective_penalty = float(
+        bo_file_config.infeasible_objective_penalty
+        if args.infeasible_objective_penalty is None
+        else args.infeasible_objective_penalty
+    )
+    maxiter = 15 if args.maxiter is None else int(args.maxiter)
+    maxfev = 40 if args.maxfev is None else int(args.maxfev)
+    xatol = 0.25 if args.xatol is None else float(args.xatol)
+    fatol = 1.0e-9 if args.fatol is None else float(args.fatol)
+    random_seed = int(bo_file_config.random_seed if args.seed is None else args.seed)
+    init_points = int(bo_file_config.init_points if args.init_points is None else args.init_points)
+    n_iter = int(bo_file_config.n_iter if args.n_iter is None else args.n_iter)
+    acquisition_kind = str(bo_file_config.acquisition_kind if args.acq_kind is None else args.acq_kind)
+    acquisition_kappa = float(bo_file_config.acquisition_kappa if args.kappa is None else args.kappa)
+    acquisition_xi = float(bo_file_config.acquisition_xi if args.xi is None else args.xi)
+
+    if args.knot_time_custom_support_tau is not None:
+        knot_time_custom_support_tau = _parse_normalized_support_tau_arg(
+            args.knot_time_custom_support_tau,
+            num_knots=num_knots,
+        )
+    else:
+        knot_time_custom_support_tau = bo_file_config.knot_time_custom_support_tau
+
+    config = build_problem_config(
+        formulation=formulation,
+        num_knots=num_knots,
+        knot_time_schedule=knot_time_schedule,
+        knot_time_custom_support_tau=knot_time_custom_support_tau,
+        front_definition_mode=args.front_definition_mode,
+    )
+    config = replace(config, T_ref_bounds_C=bo_file_config.T_ref_bounds_C)
+    config = apply_simulation_profile(config, simulation_profile)
+    knot_time_normalized_support_tau = tuple(
+        float(value) / float(config.horizon_s) for value in config.knot_times_s
+    )
+    theta0 = _parse_theta_arg(args.theta0, num_knots=len(config.knot_times_s))
+    if theta0 is None:
+        theta0 = _default_theta0_for_config(config)
+    run_name = _resolved_run_name(
+        requested_run_name=args.run_name,
+        config=config,
+        formulation=formulation,
+        knot_time_schedule=knot_time_schedule,
+    )
+
+    theta_bounds_C = (
+        _parse_theta_bounds_arg(args.theta_bounds, num_knots=len(config.knot_times_s))
+        if args.theta_bounds is not None
+        else bo_file_config.theta_bounds_C
+    )
+    bayesopt_config = BayesianOptimizationConfig(
+        random_seed=random_seed,
+        init_points=init_points,
+        n_iter=n_iter,
+        acquisition_kind=acquisition_kind,
+        acquisition_kappa=acquisition_kappa,
+        acquisition_xi=acquisition_xi,
+        theta_bounds_C=theta_bounds_C,
+        seed_with_theta0=bool(bo_file_config.seed_with_theta0) and not bool(args.no_seed_theta0),
+    )
+
+    if args.dry_run_config:
+        print(
+            json.dumps(
+                _effective_config_payload(
+                    args=args,
+                    run_name=run_name,
+                    formulation=formulation,
+                    method=method,
+                    simulation_profile_name=simulation_profile_name,
+                    config=config,
+                    theta0=theta0,
+                    theta_bounds_C=theta_bounds_C,
+                    knot_time_schedule=knot_time_schedule,
+                    knot_time_normalized_support_tau=knot_time_normalized_support_tau,
+                    bayesopt_config=bayesopt_config,
+                    infeasible_objective_penalty=infeasible_objective_penalty,
+                ),
+                indent=2,
+            )
+        )
+        return
+
+    out_root_dir = Path(args.out_root_dir)
+    run_dir = out_root_dir / run_name
+    if run_dir.exists():
+        if not args.overwrite:
+            raise FileExistsError(
+                f"{run_dir} already exists. Re-run with --overwrite to replace this deterministic run folder."
+            )
+        shutil.rmtree(run_dir)
+
+    bcs = config.solver_kwargs["bcs"]
+    T_fill_C = float(config.solver_kwargs["T_fill_C"])
+
+    print(
+        "Using canonical cryostage parameters "
+        f"(tau_s={DEFAULT_CRYOSTAGE_PARAMS.tau_s:.6f}, "
+        f"gain={DEFAULT_CRYOSTAGE_PARAMS.gain:.6f}, "
+        f"offset_C={DEFAULT_CRYOSTAGE_PARAMS.offset_C:.6f})"
+    )
+    print(f"Formulation = {formulation}")
+    print(f"Optimizer method = {method}")
+    print(f"Simulation profile = {simulation_profile_name}")
+    print(f"Active workflow chain = {ACTIVE_WORKFLOW_CHAIN}")
+    print(f"Active T_ref bounds = {config.T_ref_bounds_C}")
+    print(f"Monotonicity required = {config.require_monotone_nonincreasing}")
+    print(f"Characterization admissibility enforced = {config.enforce_characterization_admissibility}")
+    if config.enforce_characterization_admissibility:
+        print(f"Characterization constraints dir = {config.characterization_constraints_dir}")
+    print(f"Safety cap (horizon_s) = {config.safety_cap_s:.1f} s")
+    print(f"Trajectory parameter count = {len(config.knot_times_s)}")
+    print(f"External time schedule = {knot_time_schedule}")
+    print(f"Normalized support = {knot_time_normalized_support_tau}")
+    print(f"Control support times = {config.knot_times_s}")
+    print(f"Initial theta = {theta0}")
+    print(f"BO theta bounds = {bayesopt_config.theta_bounds_C}")
+    print(
+        "BO settings "
+        f"(seed={bayesopt_config.random_seed}, init_points={bayesopt_config.init_points}, "
+        f"n_iter={bayesopt_config.n_iter}, acq={bayesopt_config.acquisition_kind}, "
+        f"kappa={bayesopt_config.acquisition_kappa:.6f}, xi={bayesopt_config.acquisition_xi:.6f}, "
+        f"seed_with_theta0={bayesopt_config.seed_with_theta0})"
+    )
+    print(f"Infeasible objective penalty = {float(infeasible_objective_penalty):.6g}")
+    reference_contract = front_reference_contract_summary(config)
+    front_definition_contract = front_definition_contract_summary(config)
+    print(f"Front definition mode = {front_definition_contract['front_definition_mode']}")
+    print(f"Front threshold = {front_definition_contract['front_threshold_C']:.9e} C")
+    print(f"Front reference mode = {config.front_reference_mode}")
+    print(
+        "Front target "
+        f"(H_fill={reference_contract['H_fill_m']:.9e} m, "
+        f"target_end={reference_contract['target_end_s']:.3f} s, "
+        f"speed={reference_contract['implied_target_front_speed_m_per_s']:.9e} m/s)"
+    )
+    print(
+        "Objective weights "
+        f"(tracking={config.tracking_weight:.6f}, completion={config.completion_weight:.6f}, "
+        f"smoothness={config.smoothness_weight:.6f}, terminal={config.terminal_weight:.6f})"
+    )
+    print(
+        "Runner thermal settings "
+        f"(T_fill_C={T_fill_C:.6f}, h_top={bcs.h_top:.6f}, h_side={bcs.h_side:.6f})"
+    )
+    print(
+        "Ambient model = "
+        f"{describe_ambient_temperature_model(config.solver_kwargs.get('ambient_temperature_from_plate_C'))}"
+    )
+    print(
+        "Runtime settings "
+        f"(Nr={config.solver_kwargs['Nr']}, Nz={config.solver_kwargs['Nz']}, "
+        f"dt={config.solver_kwargs['dt']:.3f}, write_every={config.solver_kwargs['write_every']:.1f})"
+    )
+
+    result = optimize_open_loop_theta(
+        theta0=theta0,
+        config=config,
+        cryostage_params=DEFAULT_CRYOSTAGE_PARAMS,
+        out_root_dir=out_root_dir,
+        run_name=run_name,
+        method=method,
+        options={
+            "maxiter": maxiter,
+            "maxfev": maxfev,
+            "xatol": xatol,
+            "fatol": fatol,
+        },
+        bayesopt_config=bayesopt_config,
+        infeasible_objective_penalty=float(infeasible_objective_penalty),
+    )
+
+    analysis_dir = result.run_dir / "analysis"
+    analysis_dir.mkdir(exist_ok=True)
+
+    best_front_path = result.best_dir / f"{result.best_case_name}_front.csv"
+    history_plot_path = analysis_dir / "objective_history.png"
+    feasibility_plot_path = analysis_dir / "feasible_vs_infeasible.png"
+    front_plot_path = analysis_dir / "best_front_tracking.png"
+    plate_reference_plot_path = analysis_dir / "plate_reference_trajectory.png"
+    best_theta_profile_csv = result.run_dir / "best_theta_profile.csv"
+    best_summary_md = result.run_dir / "best_solution_summary.md"
+    run_settings_json = result.run_dir / "run_settings.json"
+
+    _plot_objective_history(result, history_plot_path)
+    _plot_feasibility_timeline(result, feasibility_plot_path)
+    _plot_best_front_tracking(best_front_path=best_front_path, config=config, out_path=front_plot_path)
+    _plot_best_plate_reference_trajectory(theta_C=result.best_theta, config=config, out_path=plate_reference_plot_path)
+    _write_best_theta_profile_csv(best_theta_profile_csv, knot_times_s=config.knot_times_s, theta_C=result.best_theta)
+
+    bo_runtime = bayes_opt_runtime_details() if str(result.method) == "bayesian-optimization" else None
+    reference_contract = front_reference_contract_summary(config)
+    front_definition_contract = front_definition_contract_summary(config)
+
+    _write_best_solution_summary(
+        out_path=best_summary_md,
+        result=result,
+        config=config,
+        theta0=theta0,
+        theta_bounds_C=bayesopt_config.theta_bounds_C,
+        knot_time_schedule=knot_time_schedule,
+        knot_time_normalized_support_tau=knot_time_normalized_support_tau,
+        infeasible_objective_penalty=float(infeasible_objective_penalty),
+        best_theta_profile_csv=best_theta_profile_csv,
+        history_plot_path=history_plot_path,
+        feasibility_plot_path=feasibility_plot_path,
+        front_plot_path=front_plot_path,
+        plate_reference_plot_path=plate_reference_plot_path,
+        bo_runtime=bo_runtime,
+        smoke_test_note=args.smoke_test_note,
+    )
+    run_settings_json.write_text(
+        json.dumps(
+            {
+                "run_name": run_name,
+                "method": result.method,
+                "formulation": formulation,
+                "simulation_profile": simulation_profile_name,
+                "simulation_config": str(Path(args.simulation_config)),
+                "bo_config": str(Path(args.bo_config)),
+                "workflow_chain": ACTIVE_WORKFLOW_CHAIN,
+                "trajectory_parameter_count": len(config.knot_times_s),
+                "num_knots": len(config.knot_times_s),
+                "knot_time_schedule": str(knot_time_schedule),
+                "knot_time_custom_support_tau": None if knot_time_custom_support_tau is None else [float(value) for value in knot_time_custom_support_tau],
+                "knot_time_normalized_support_tau": [float(value) for value in knot_time_normalized_support_tau],
+                "support_times_s": [float(value) for value in config.knot_times_s],
+                "knot_times_s": [float(value) for value in config.knot_times_s],
+                "initial_theta": [float(value) for value in theta0],
+                "theta_bounds_C": bayesopt_config.theta_bounds_C,
+                "infeasible_objective_penalty": float(infeasible_objective_penalty),
+                "front_definition_mode": front_definition_contract['front_definition_mode'],
+                "front_threshold_C": front_definition_contract['front_threshold_C'],
+                "front_definition_contract": front_definition_contract,
+                "front_reference_mode": config.front_reference_mode,
+                "H_fill_m": reference_contract["H_fill_m"],
+                "target_end_s": reference_contract["target_end_s"],
+                "implied_target_front_speed_m_per_s": reference_contract["implied_target_front_speed_m_per_s"],
+                "front_reference_contract": reference_contract,
+                "objective_weights": {
+                    "tracking_weight": config.tracking_weight,
+                    "smoothness_weight": config.smoothness_weight,
+                    "completion_weight": config.completion_weight,
+                    "terminal_weight": config.terminal_weight,
+                },
+                "solver": {
+                    "Nr": int(config.solver_kwargs["Nr"]),
+                    "Nz": int(config.solver_kwargs["Nz"]),
+                    "dt": float(config.solver_kwargs["dt"]),
+                    "Nz_front": int(config.solver_kwargs["Nz_front"]),
+                    "Nr_front_curve": int(config.solver_kwargs.get("Nr_front_curve", 25)),
+                    "Nz_front_curve": int(config.solver_kwargs.get("Nz_front_curve", 400)),
+                    "write_every": float(config.solver_kwargs["write_every"]),
+                    "write_field_output": bool(config.solver_kwargs.get("write_field_output", True)),
+                    "write_probe_csv": bool(config.solver_kwargs.get("write_probe_csv", True)),
+                    "show_progress": bool(config.solver_kwargs.get("show_progress", True)),
+                    "enable_front_curve": bool(config.solver_kwargs.get("enable_front_curve", True)),
+                    "use_tabulated_water_ice": bool(config.solver_kwargs.get("use_tabulated_water_ice", False)),
+                    "ambient": describe_ambient_temperature_model(
+                        config.solver_kwargs.get("ambient_temperature_from_plate_C")
+                    ),
+                },
+                "bo": {
+                    "random_seed": bayesopt_config.random_seed,
+                    "init_points": bayesopt_config.init_points,
+                    "n_iter": bayesopt_config.n_iter,
+                    "acquisition_kind": bayesopt_config.acquisition_kind,
+                    "acquisition_kappa": bayesopt_config.acquisition_kappa,
+                    "acquisition_xi": bayesopt_config.acquisition_xi,
+                    "seed_with_theta0": bayesopt_config.seed_with_theta0,
+                },
+                "artifacts": {
+                    "history_csv_path": str(result.history_csv_path.resolve()),
+                    "best_dir": str(result.best_dir.resolve()),
+                    "best_theta_profile_csv": str(best_theta_profile_csv.resolve()),
+                    "best_summary_md": str(best_summary_md.resolve()),
+                    "objective_history_plot": str(history_plot_path.resolve()),
+                    "feasibility_plot": str(feasibility_plot_path.resolve()),
+                    "front_tracking_plot": str(front_plot_path.resolve()),
+                    "plate_reference_trajectory_plot": str(plate_reference_plot_path.resolve()),
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    total_evaluations = len(result.history)
+    feasible_evaluations = sum(1 for entry in result.history if entry.is_valid)
+    infeasible_evaluations = sum(1 for entry in result.history if entry.feasibility_status == "infeasible")
+    expensive_runs = sum(1 for entry in result.history if entry.expensive_simulation_executed)
+    best_theta_is_valid = _theta_satisfies_active_constraints(result.best_theta, config)
+
+    print("Optimization summary")
+    print(f"Best theta: {result.best_theta}")
+    print(f"Best theta satisfies active constraints: {best_theta_is_valid}")
+    print(f"Best J: {result.best_objective_value:.9e}")
+    print(
+        f"Evaluations: total={total_evaluations}, feasible={feasible_evaluations}, "
+        f"infeasible={infeasible_evaluations}, expensive_simulation_executed={expensive_runs}, nfev={result.nfev}"
+    )
+    print(
+        f"Optimizer termination: success={result.success}, status={result.status}, "
+        f"message={result.message}"
+    )
+    print(f"Evaluation history: {result.history_csv_path}")
+    print(f"Best run folder: {result.best_dir}")
+    print(f"Best theta profile CSV: {best_theta_profile_csv}")
+    print(f"Best plate/reference plot: {plate_reference_plot_path}")
+    print(f"Best solution summary: {best_summary_md}")
+    print(f"Run settings JSON: {run_settings_json}")
+    print(f"Analysis folder: {analysis_dir}")
+
+
+if __name__ == "__main__":
+    main()
