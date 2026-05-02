@@ -28,20 +28,47 @@ class ConstantVelocityObjectiveConfig:
     target_front_speed_mm_s: float
     control_z_min_mm: float
     control_z_max_mm: float
+    direct_speed_weight: float = 0.0
+    direct_speed_tolerance_pct: float = 0.0
+    segment_speed_weight: float = 0.0
+    segment_speed_tolerance_pct: float = 0.0
+    segment_speed_num_segments: int = 0
 
     def __post_init__(self) -> None:
         target_front_speed_mm_s = float(self.target_front_speed_mm_s)
         control_z_min_mm = float(self.control_z_min_mm)
         control_z_max_mm = float(self.control_z_max_mm)
+        direct_speed_weight = float(self.direct_speed_weight)
+        direct_speed_tolerance_pct = float(self.direct_speed_tolerance_pct)
+        segment_speed_weight = float(self.segment_speed_weight)
+        segment_speed_tolerance_pct = float(self.segment_speed_tolerance_pct)
+        segment_speed_num_segments = int(self.segment_speed_num_segments)
         if not math.isfinite(target_front_speed_mm_s) or target_front_speed_mm_s <= 0.0:
             raise ValueError("target_front_speed_mm_s must be finite and positive")
         if not math.isfinite(control_z_min_mm) or not math.isfinite(control_z_max_mm):
             raise ValueError("control z limits must be finite")
         if control_z_min_mm < 0.0 or control_z_max_mm <= control_z_min_mm:
             raise ValueError("control z limits must satisfy 0 <= z_min < z_max")
+        if not math.isfinite(direct_speed_weight) or direct_speed_weight < 0.0:
+            raise ValueError("direct_speed_weight must be finite and non-negative")
+        if not math.isfinite(direct_speed_tolerance_pct) or direct_speed_tolerance_pct < 0.0:
+            raise ValueError("direct_speed_tolerance_pct must be finite and non-negative")
+        if not math.isfinite(segment_speed_weight) or segment_speed_weight < 0.0:
+            raise ValueError("segment_speed_weight must be finite and non-negative")
+        if not math.isfinite(segment_speed_tolerance_pct) or segment_speed_tolerance_pct < 0.0:
+            raise ValueError("segment_speed_tolerance_pct must be finite and non-negative")
+        if segment_speed_num_segments < 0:
+            raise ValueError("segment_speed_num_segments must be non-negative")
+        if segment_speed_weight > 0.0 and segment_speed_num_segments < 2:
+            raise ValueError("segment_speed_num_segments must be at least 2 when segment_speed_weight is positive")
         object.__setattr__(self, "target_front_speed_mm_s", target_front_speed_mm_s)
         object.__setattr__(self, "control_z_min_mm", control_z_min_mm)
         object.__setattr__(self, "control_z_max_mm", control_z_max_mm)
+        object.__setattr__(self, "direct_speed_weight", direct_speed_weight)
+        object.__setattr__(self, "direct_speed_tolerance_pct", direct_speed_tolerance_pct)
+        object.__setattr__(self, "segment_speed_weight", segment_speed_weight)
+        object.__setattr__(self, "segment_speed_tolerance_pct", segment_speed_tolerance_pct)
+        object.__setattr__(self, "segment_speed_num_segments", segment_speed_num_segments)
 
 
 @dataclass(frozen=True)
@@ -89,6 +116,38 @@ class VelocityTrackingSummary:
             "reached_control_z_min": int(self.reached_control_z_min),
             "reached_control_z_max": int(self.reached_control_z_max),
             "num_tracking_samples": int(self.num_tracking_samples),
+        }
+
+
+@dataclass(frozen=True)
+class SegmentSpeedSummary:
+    target_front_speed_mm_s: float
+    segment_speed_num_segments: int
+    segment_speed_num_valid_segments: int
+    segment_speed_penalty: float
+    segment_speed_rmse_pct: float
+    segment_speed_mean_abs_error_pct: float
+    segment_speed_max_abs_error_pct: float
+    segment_speed_min_mm_s: float
+    segment_speed_max_mm_s: float
+    segment_speed_spread_mm_s: float
+    segment_speed_weight: float
+    segment_speed_tolerance_pct: float
+
+    def to_dict(self) -> dict[str, float | int]:
+        return {
+            "target_front_speed_mm_s": float(self.target_front_speed_mm_s),
+            "segment_speed_num_segments": int(self.segment_speed_num_segments),
+            "segment_speed_num_valid_segments": int(self.segment_speed_num_valid_segments),
+            "segment_speed_penalty": float(self.segment_speed_penalty),
+            "segment_speed_rmse_pct": float(self.segment_speed_rmse_pct),
+            "segment_speed_mean_abs_error_pct": float(self.segment_speed_mean_abs_error_pct),
+            "segment_speed_max_abs_error_pct": float(self.segment_speed_max_abs_error_pct),
+            "segment_speed_min_mm_s": float(self.segment_speed_min_mm_s),
+            "segment_speed_max_mm_s": float(self.segment_speed_max_mm_s),
+            "segment_speed_spread_mm_s": float(self.segment_speed_spread_mm_s),
+            "segment_speed_weight": float(self.segment_speed_weight),
+            "segment_speed_tolerance_pct": float(self.segment_speed_tolerance_pct),
         }
 
 
@@ -245,6 +304,150 @@ def temperature_smoothness_penalty(
     return float(np.mean(scaled_slopes * scaled_slopes))
 
 
+def direct_speed_error_penalty(
+    tracking_summary: VelocityTrackingSummary,
+    objective_config: ConstantVelocityObjectiveConfig,
+    *,
+    incomplete_penalty_value: float,
+) -> tuple[float, float, float]:
+    target_speed = float(objective_config.target_front_speed_mm_s)
+    achieved_speed = float(tracking_summary.actual_interval_speed_mm_s)
+    if not (math.isfinite(target_speed) and target_speed > 0.0 and math.isfinite(achieved_speed)):
+        return float(incomplete_penalty_value), math.nan, math.nan
+    signed_relative_error = float((achieved_speed - target_speed) / target_speed)
+    abs_relative_error = abs(signed_relative_error)
+    tolerance = float(objective_config.direct_speed_tolerance_pct) / 100.0
+    excess_error = max(abs_relative_error - tolerance, 0.0)
+    return float(excess_error * excess_error), float(signed_relative_error), float(abs_relative_error * 100.0)
+
+
+def segment_speed_rows(
+    front_trajectory: FrontTrajectory,
+    objective_config: ConstantVelocityObjectiveConfig,
+) -> list[dict[str, float | int]]:
+    num_segments = int(objective_config.segment_speed_num_segments)
+    if num_segments <= 0:
+        return []
+
+    control_time_s = np.asarray(front_trajectory.time_since_fill_s, dtype=np.float64)
+    z_front_m = np.asarray(front_trajectory.z_front_m, dtype=np.float64)
+    finite = np.isfinite(control_time_s) & np.isfinite(z_front_m) & (control_time_s >= 0.0)
+    z_boundaries_mm = np.linspace(
+        float(objective_config.control_z_min_mm),
+        float(objective_config.control_z_max_mm),
+        num_segments + 1,
+        dtype=np.float64,
+    )
+    crossing_times_s = [
+        first_time_at_or_above(control_time_s[finite], z_front_m[finite], float(z_mm) * 1.0e-3)
+        for z_mm in z_boundaries_mm
+    ]
+
+    target_speed = float(objective_config.target_front_speed_mm_s)
+    rows: list[dict[str, float | int]] = []
+    for idx in range(num_segments):
+        z0_mm = float(z_boundaries_mm[idx])
+        z1_mm = float(z_boundaries_mm[idx + 1])
+        t0_s = float(crossing_times_s[idx])
+        t1_s = float(crossing_times_s[idx + 1])
+        if math.isfinite(t0_s) and math.isfinite(t1_s) and t1_s > t0_s:
+            speed_mm_s = float((z1_mm - z0_mm) / (t1_s - t0_s))
+            signed_relative_error = float((speed_mm_s - target_speed) / target_speed)
+            abs_relative_error_pct = float(abs(signed_relative_error) * 100.0)
+        else:
+            speed_mm_s = math.nan
+            signed_relative_error = math.nan
+            abs_relative_error_pct = math.nan
+        rows.append(
+            {
+                "segment_index": int(idx),
+                "z_start_mm": z0_mm,
+                "z_end_mm": z1_mm,
+                "t_start_crossing_s": t0_s,
+                "t_end_crossing_s": t1_s,
+                "speed_mm_s": float(speed_mm_s),
+                "signed_relative_error": float(signed_relative_error),
+                "abs_relative_error_pct": float(abs_relative_error_pct),
+            }
+        )
+    return rows
+
+
+def segment_speed_error_penalty(
+    front_trajectory: FrontTrajectory,
+    objective_config: ConstantVelocityObjectiveConfig,
+    *,
+    incomplete_penalty_value: float,
+) -> SegmentSpeedSummary:
+    rows = segment_speed_rows(front_trajectory, objective_config)
+    num_segments = int(objective_config.segment_speed_num_segments)
+    if num_segments <= 0:
+        return SegmentSpeedSummary(
+            target_front_speed_mm_s=float(objective_config.target_front_speed_mm_s),
+            segment_speed_num_segments=0,
+            segment_speed_num_valid_segments=0,
+            segment_speed_penalty=0.0,
+            segment_speed_rmse_pct=math.nan,
+            segment_speed_mean_abs_error_pct=math.nan,
+            segment_speed_max_abs_error_pct=math.nan,
+            segment_speed_min_mm_s=math.nan,
+            segment_speed_max_mm_s=math.nan,
+            segment_speed_spread_mm_s=math.nan,
+            segment_speed_weight=float(objective_config.segment_speed_weight),
+            segment_speed_tolerance_pct=float(objective_config.segment_speed_tolerance_pct),
+        )
+
+    speeds = np.asarray([float(row["speed_mm_s"]) for row in rows], dtype=np.float64)
+    valid = np.isfinite(speeds)
+    target_speed = float(objective_config.target_front_speed_mm_s)
+    tolerance = float(objective_config.segment_speed_tolerance_pct) / 100.0
+    if np.count_nonzero(valid) != num_segments:
+        penalty = float(incomplete_penalty_value)
+    else:
+        relative_errors = (speeds[valid] - target_speed) / target_speed
+        excess_errors = np.maximum(np.abs(relative_errors) - tolerance, 0.0)
+        penalty = float(np.mean(excess_errors * excess_errors))
+
+    if np.any(valid):
+        abs_error_pct = np.abs((speeds[valid] - target_speed) / target_speed) * 100.0
+        rmse_pct = float(np.sqrt(np.mean(abs_error_pct * abs_error_pct)))
+        mean_abs_pct = float(np.mean(abs_error_pct))
+        max_abs_pct = float(np.max(abs_error_pct))
+        min_speed = float(np.min(speeds[valid]))
+        max_speed = float(np.max(speeds[valid]))
+        spread = float(max_speed - min_speed)
+    else:
+        rmse_pct = math.nan
+        mean_abs_pct = math.nan
+        max_abs_pct = math.nan
+        min_speed = math.nan
+        max_speed = math.nan
+        spread = math.nan
+
+    return SegmentSpeedSummary(
+        target_front_speed_mm_s=target_speed,
+        segment_speed_num_segments=num_segments,
+        segment_speed_num_valid_segments=int(np.count_nonzero(valid)),
+        segment_speed_penalty=float(penalty),
+        segment_speed_rmse_pct=float(rmse_pct),
+        segment_speed_mean_abs_error_pct=float(mean_abs_pct),
+        segment_speed_max_abs_error_pct=float(max_abs_pct),
+        segment_speed_min_mm_s=float(min_speed),
+        segment_speed_max_mm_s=float(max_speed),
+        segment_speed_spread_mm_s=float(spread),
+        segment_speed_weight=float(objective_config.segment_speed_weight),
+        segment_speed_tolerance_pct=float(objective_config.segment_speed_tolerance_pct),
+    )
+
+
+def write_segment_speed_summary_csv(path: Path, summary: SegmentSpeedSummary) -> None:
+    row = summary.to_dict()
+    with Path(path).open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer.writeheader()
+        writer.writerow(row)
+
+
 def write_tracking_summary_csv(path: Path, summary: VelocityTrackingSummary) -> None:
     row = summary.to_dict()
     with Path(path).open("w", newline="") as f:
@@ -258,8 +461,14 @@ def _write_objective_summary_csv(
     *,
     objective_value: float,
     tracking_summary: VelocityTrackingSummary,
+    segment_speed_summary: SegmentSpeedSummary,
     smoothness_penalty: float,
     completion_penalty: float,
+    direct_speed_penalty: float,
+    direct_speed_relative_error: float,
+    direct_speed_relative_error_pct: float,
+    direct_speed_weight: float,
+    direct_speed_tolerance_pct: float,
     num_objective_samples: int,
 ) -> Path:
     row = {
@@ -267,6 +476,12 @@ def _write_objective_summary_csv(
         "tracking_mse": float(tracking_summary.tracking_mse),
         "smoothness_penalty": float(smoothness_penalty),
         "completion_penalty": float(completion_penalty),
+        "direct_speed_penalty": float(direct_speed_penalty),
+        "direct_speed_relative_error": float(direct_speed_relative_error),
+        "direct_speed_relative_error_pct": float(direct_speed_relative_error_pct),
+        "direct_speed_weight": float(direct_speed_weight),
+        "direct_speed_tolerance_pct": float(direct_speed_tolerance_pct),
+        **segment_speed_summary.to_dict(),
         "num_objective_samples": int(num_objective_samples),
         **tracking_summary.to_dict(),
     }
@@ -377,17 +592,35 @@ def evaluate_velocity_control_objective(
     )
     smoothness_penalty = temperature_smoothness_penalty(T_ref_profile_C, config)
     completion_penalty = float(tracking_summary.completion_penalty)
+    direct_speed_penalty, direct_speed_relative_error, direct_speed_relative_error_pct = direct_speed_error_penalty(
+        tracking_summary,
+        objective_config,
+        incomplete_penalty_value=config.incomplete_penalty_value,
+    )
+    segment_speed_summary = segment_speed_error_penalty(
+        front_trajectory,
+        objective_config,
+        incomplete_penalty_value=config.incomplete_penalty_value,
+    )
     objective_value = (
         config.tracking_weight * float(tracking_summary.tracking_mse)
         + config.completion_weight * completion_penalty
         + config.smoothness_weight * float(smoothness_penalty)
+        + float(objective_config.direct_speed_weight) * float(direct_speed_penalty)
+        + float(objective_config.segment_speed_weight) * float(segment_speed_summary.segment_speed_penalty)
     )
     summary_path = _write_objective_summary_csv(
         Path(out_dir) / f"{case_name}_velocity_objective_summary.csv",
         objective_value=float(objective_value),
         tracking_summary=tracking_summary,
+        segment_speed_summary=segment_speed_summary,
         smoothness_penalty=float(smoothness_penalty),
         completion_penalty=float(completion_penalty),
+        direct_speed_penalty=float(direct_speed_penalty),
+        direct_speed_relative_error=float(direct_speed_relative_error),
+        direct_speed_relative_error_pct=float(direct_speed_relative_error_pct),
+        direct_speed_weight=float(objective_config.direct_speed_weight),
+        direct_speed_tolerance_pct=float(objective_config.direct_speed_tolerance_pct),
         num_objective_samples=int(tracking_summary.num_tracking_samples),
     )
 
@@ -410,13 +643,18 @@ def evaluate_velocity_control_objective(
 
 __all__ = [
     "ConstantVelocityObjectiveConfig",
+    "SegmentSpeedSummary",
     "VelocityTrackingSeries",
     "VelocityTrackingSummary",
     "constant_velocity_tracking",
+    "direct_speed_error_penalty",
     "evaluate_velocity_control_objective",
     "first_time_at_or_above",
+    "segment_speed_error_penalty",
+    "segment_speed_rows",
     "temperature_smoothness_penalty",
     "thermocouple_interval_speeds",
+    "write_segment_speed_summary_csv",
     "write_rows_csv",
     "write_tracking_summary_csv",
 ]

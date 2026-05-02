@@ -28,7 +28,10 @@ from code_simulation.optimization.open_loop_workflow_config import OpenLoopProbl
 from code_simulation.optimization.velocity_objective import (
     ConstantVelocityObjectiveConfig,
     constant_velocity_tracking,
+    segment_speed_error_penalty,
+    segment_speed_rows,
     thermocouple_interval_speeds,
+    write_segment_speed_summary_csv,
     write_rows_csv,
     write_tracking_summary_csv,
 )
@@ -205,6 +208,13 @@ def write_velocity_bo_report(
         f"- Initial plate temperature: `{initial_plate_temperature_C:.6g} C`.",
         f"- Simulation profile: `{simulation_profile_name}`.",
         f"- Tabulated water/ice properties enabled: `{str(bool(use_tabulated_water_ice)).lower()}`.",
+        f"- Direct-speed objective weight: `{objective_config.direct_speed_weight:.6g}`.",
+        (
+            "- Segment-speed objective: "
+            f"`{objective_config.segment_speed_num_segments}` segments, "
+            f"weight `{objective_config.segment_speed_weight:.6g}`, "
+            f"tolerance `{objective_config.segment_speed_tolerance_pct:.6g}%`."
+        ),
         "",
         "## BO Result",
         "",
@@ -228,7 +238,8 @@ def write_velocity_bo_report(
         "## Metric Notes",
         "",
         "- The BO objective uses the direct simulated front position `z_front(t)`.",
-        "- The raw finite-difference velocity `v_front_mm_per_s` is not optimized because it is a noisy derivative.",
+        "- When enabled, the segment-speed term penalizes unequal average speeds across depth intervals.",
+        "- The raw finite-difference velocity `v_front_mm_per_s` remains diagnostic because it is a noisy derivative.",
         "- Thermocouple-equivalent speeds are interval averages and are written only for diagnostic comparison with experiments.",
         "",
     ]
@@ -300,6 +311,19 @@ def finalize_velocity_bo_outputs(
         best_tracking_summary_path = run_dir / "best_tracking_summary.csv"
         write_tracking_summary_csv(best_tracking_summary_path, tracking_summary)
         artifacts["best_tracking_summary"] = best_tracking_summary_path
+        if objective_config.segment_speed_num_segments > 0:
+            segment_summary = segment_speed_error_penalty(
+                front,
+                objective_config,
+                incomplete_penalty_value=config.incomplete_penalty_value,
+            )
+            segment_summary_path = run_dir / "best_segment_speed_summary.csv"
+            write_segment_speed_summary_csv(segment_summary_path, segment_summary)
+            artifacts["best_segment_speed_summary"] = segment_summary_path
+
+            segment_rows_path = run_dir / "best_segment_speeds.csv"
+            write_rows_csv(segment_rows_path, segment_speed_rows(front, objective_config))
+            artifacts["best_segment_speeds"] = segment_rows_path
 
         best_front_plot_path = run_dir / "best_front_position_vs_reference.png"
         plot_best_front_position(

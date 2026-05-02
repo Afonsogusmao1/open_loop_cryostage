@@ -1,0 +1,14 @@
+item,value
+Characterization files used,12
+Nominal reference targets,"-20, -15, -10, -5 deg C"
+Replicates per nominal target,"-20 C: 3, -15 C: 3, -10 C: 3, -5 C: 3"
+Active cooling threshold,First telemetry row with power > 1.0
+Active telemetry samples retained,64320
+Adjacent active sample pairs,64308
+Median telemetry sampling interval,0.111 s
+Active cooling duration after trimming,"454.3-795.5 s across runs; by target: -20 C: 454.3-486.8 s, -15 C: 651.9-681.4 s, -10 C: 663.6-689.6 s, -5 C: 674.4-795.5 s"
+Active duration relative to fitted response time,6.0-8.0 fitted time constants
+Time-constant search interval,10-250 s for each characterized setpoint
+Fitting criterion,Minimum pooled active step-response trajectory RMSE at each setpoint
+Pooled recursive trajectory RMSE on active telemetry,0.378905 deg C
+Mean recursive RMSE by nominal target on active telemetry,"-20 C: 0.351 C, -15 C: 0.368 C, -10 C: 0.375 C, -5 C: 0.404 C"

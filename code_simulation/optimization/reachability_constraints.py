@@ -481,25 +481,35 @@ def _hold_duration_after_segment_end_s(
 ) -> float:
     target_C = float(knot_temperatures_C[segment_end_index])
     band_floor_C = target_C - float(tolerance_band_C)
+    band_ceiling_C = target_C + float(tolerance_band_C)
     arrival_time_s = float(knot_times_s[segment_end_index])
     current_time_s = arrival_time_s
     current_temp_C = target_C
+    explicit_band_dwell_detected = False
 
     for next_idx in range(segment_end_index + 1, len(knot_times_s)):
         next_time_s = float(knot_times_s[next_idx])
         next_temp_C = float(knot_temperatures_C[next_idx])
-        if next_temp_C >= band_floor_C - 1e-12:
+        if band_floor_C - 1.0e-12 <= next_temp_C <= band_ceiling_C + 1.0e-12:
+            explicit_band_dwell_detected = True
             current_time_s = next_time_s
             current_temp_C = next_temp_C
             continue
 
+        if not explicit_band_dwell_detected:
+            return 0.0
+
         if abs(next_temp_C - current_temp_C) <= 1e-12:
             leave_time_s = current_time_s
         else:
-            frac = (band_floor_C - current_temp_C) / (next_temp_C - current_temp_C)
+            threshold_C = band_floor_C if next_temp_C < band_floor_C else band_ceiling_C
+            frac = (threshold_C - current_temp_C) / (next_temp_C - current_temp_C)
             frac = min(max(frac, 0.0), 1.0)
             leave_time_s = current_time_s + frac * (next_time_s - current_time_s)
         return max(float(leave_time_s - arrival_time_s), 0.0)
+
+    if not explicit_band_dwell_detected:
+        return 0.0
 
     return max(float(current_time_s - arrival_time_s), 0.0)
 
@@ -575,7 +585,7 @@ def check_segment_admissibility(
     conservative_settling = math.nan
     arrival_band_check_passed = True
     settling_check_passed = True
-    if is_within_direct_characterization_support(
+    if hold_like_after_segment and is_within_direct_characterization_support(
         float(T_end_C),
         constraints,
         temperature_margin_C=characterization_temperature_margin_C,
@@ -601,7 +611,7 @@ def check_segment_admissibility(
                 f"arrival {cumulative_time_to_end_s:.1f} s, required {conservative_first_entry:.1f} s"
             )
 
-        if hold_like_after_segment and math.isfinite(conservative_settling) and cumulative_time_to_end_s < conservative_settling - 1e-12:
+        if math.isfinite(conservative_settling) and cumulative_time_to_end_s < conservative_settling - 1e-12:
             settling_check_passed = False
             reasons.append(
                 "requested hold begins before the conservative settling time at the target: "

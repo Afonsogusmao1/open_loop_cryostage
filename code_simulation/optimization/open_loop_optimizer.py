@@ -176,13 +176,14 @@ def optimize_open_loop_theta(
 ) -> OpenLoopOptimizationResult:
     """Orchestrate candidate evaluation, run folders, history, and incumbent tracking."""
     theta0 = _coerce_theta_tuple(theta0, name="theta0")
-    prepare_open_loop_candidate(theta0, config)
+    method_key = _normalized_method(method)
+    use_bayesian_backend = _is_bayesian_method(method)
+    if not use_bayesian_backend:
+        prepare_open_loop_candidate(theta0, config)
 
     if not math.isfinite(float(infeasible_objective_penalty)):
         raise ValueError("infeasible_objective_penalty must be finite")
 
-    method_key = _normalized_method(method)
-    use_bayesian_backend = _is_bayesian_method(method)
     if use_bayesian_backend and bayesopt_config is None:
         bayesopt_config = BayesianOptimizationConfig()
 

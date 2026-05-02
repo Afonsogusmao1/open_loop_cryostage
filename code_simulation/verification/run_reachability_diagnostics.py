@@ -62,7 +62,7 @@ def build_example_trajectories() -> list[ExampleTrajectory]:
             name="infeasible_early_minus15_arrival",
             description="Attempts to begin a -15 C hold before the conservative settling time measured in the cryostage characterization.",
             knot_times_s=(0.0, 360.0, 720.0, 2400.0),
-            knot_temperatures_C=(-0.1, -15.0, -20.0, -20.0),
+            knot_temperatures_C=(-0.1, -15.0, -15.0, -20.0),
         ),
         ExampleTrajectory(
             name="infeasible_long_minus20_hold",
@@ -136,14 +136,14 @@ def write_json_report(
                 "This rule is not extrapolated beyond the characterized window horizon."
             ),
             "arrival_rule": (
-                "If a segment ends at a characterized cold target, cumulative arrival time must be no earlier than the conservative first-entry time into the ±0.5 C band. "
+                "If a segment ends at a characterized cold target and the subsequent command explicitly dwells within that target band, cumulative arrival time must be no earlier than the conservative first-entry time into the ±0.5 C band. "
                 "Interpolation between characterized targets uses the worse of the two bracketing targets."
             ),
             "settling_rule": (
-                "If a hold begins after reaching a cold target, cumulative arrival time must also be no earlier than the conservative settling time into the ±0.5 C band."
+                "If an explicit dwell begins after reaching a cold target, cumulative arrival time must also be no earlier than the conservative settling time into the ±0.5 C band."
             ),
             "hold_rule": (
-                "After a cold target is reached and settled, the remaining time spent within the target band must not exceed the empirical long-duration plate-hold support extracted from freezing-run T_cal telemetry."
+                "After a cold target is reached and an explicit dwell is requested within the target band, the remaining time spent within that band must not exceed the empirical long-duration plate-hold support extracted from freezing-run T_cal telemetry."
             ),
             "hold_support_basis_rule": constraints.hold_support_basis_rule,
             "outside_support_rule": (
@@ -190,8 +190,8 @@ def write_markdown_summary(
         "- Monotone non-increasing cooling remains hard-enforced in the active workflow.",
         "- Warming remains unsupported beyond the ±0.5 C practical tolerance band.",
         f"- The finite-window transient cooling envelope is enforced only up to `{max_transient_window_s(constraints):.0f} s`; the old post-window average-rate extrapolation is no longer used as the main long-duration rule.",
-        "- Reaching a cold target still requires cumulative arrival no earlier than the conservative first-entry time into the ±0.5 C band from the step-response characterization.",
-        "- Beginning a hold at that target additionally requires cumulative arrival no earlier than the conservative settling time from the step-response characterization.",
+        "- Reaching a cold target as the start of an explicit dwell still requires cumulative arrival no earlier than the conservative first-entry time into the ±0.5 C band from the step-response characterization.",
+        "- Beginning that explicit dwell additionally requires cumulative arrival no earlier than the conservative settling time from the step-response characterization.",
         f"- Long-duration hold feasibility is then capped by empirical freezing-run plate telemetry, using the conservative basis rule: {constraints.hold_support_basis_rule}",
         "",
         "## Example trajectories",

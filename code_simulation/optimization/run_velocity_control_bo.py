@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import shutil
 from dataclasses import replace
@@ -36,7 +37,10 @@ from code_simulation.optimization.velocity_objective import (
     ConstantVelocityObjectiveConfig,
     evaluate_velocity_control_objective,
 )
-from code_simulation.simulation.cryostage_model import DEFAULT_CRYOSTAGE_PARAMS
+from code_simulation.simulation.cryostage_model import (
+    DEFAULT_CRYOSTAGE_PARAMS,
+    cryostage_params_to_dict,
+)
 from code_simulation.simulation.geometry import GeometryParams
 from code_simulation.simulation.solver import FreezeStopOptions, PhaseChangeParams, PrefillOptions, ThermalBCs
 
@@ -164,7 +168,7 @@ def _build_problem_config(
         cryostage_dt_s=float(simulation_profile.cryostage_dt_s),
         knot_times_s=knot_times_s,
         front_target_speed_m_per_s=float(target.target_front_speed_mm_s) * 1.0e-3,
-        tracking_weight=1.0,
+        tracking_weight=float(args.tracking_weight),
         smoothness_weight=float(args.smoothness_weight),
         completion_weight=1.0,
         t_ignore_s=0.0,
@@ -230,6 +234,11 @@ def _build_objective_config(
         ),
         control_z_min_mm=float(target.control_z_min_mm),
         control_z_max_mm=float(target.control_z_max_mm),
+        direct_speed_weight=float(args.direct_speed_weight),
+        direct_speed_tolerance_pct=float(args.direct_speed_tolerance_pct),
+        segment_speed_weight=float(args.segment_speed_weight),
+        segment_speed_tolerance_pct=float(args.segment_speed_tolerance_pct),
+        segment_speed_num_segments=int(args.segment_speed_num_segments),
     )
 
 
@@ -289,6 +298,7 @@ def _render_effective_config(
 ) -> str:
     initial = velocity_config.initial_conditions
     uncertainty = velocity_config.temperature_uncertainty
+    cryostage_params = cryostage_params_to_dict(DEFAULT_CRYOSTAGE_PARAMS)
     lines = [
         "# Effective velocity-control BO configuration.",
         "",
@@ -311,10 +321,25 @@ def _render_effective_config(
         f"enable_front_curve = {str(bool(simulation_profile.enable_front_curve)).lower()}",
         f"use_tabulated_water_ice = {str(bool(simulation_profile.use_tabulated_water_ice)).lower()}",
         "",
+        "[cryostage_model]",
+        f'kind = "{cryostage_params["model_kind"]}"',
+        f"tau_s = {float(cryostage_params['tau_s']):.12g}",
+        f"gain = {float(cryostage_params['gain']):.12g}",
+        f"offset_C = {float(cryostage_params['offset_C']):.12g}",
+        "reference_temperatures_C = "
+        + json.dumps(cryostage_params["reference_temperatures_C"]),
+        "response_tau_s = " + json.dumps(cryostage_params["response_tau_s"]),
+        "steady_plate_C = " + json.dumps(cryostage_params["steady_plate_C"]),
+        "",
         "[velocity_target]",
         f"target_front_speed_mm_s = {objective_config.target_front_speed_mm_s:.12g}",
         f"control_z_min_mm = {objective_config.control_z_min_mm:.12g}",
         f"control_z_max_mm = {objective_config.control_z_max_mm:.12g}",
+        f"direct_speed_weight = {objective_config.direct_speed_weight:.12g}",
+        f"direct_speed_tolerance_pct = {objective_config.direct_speed_tolerance_pct:.12g}",
+        f"segment_speed_weight = {objective_config.segment_speed_weight:.12g}",
+        f"segment_speed_tolerance_pct = {objective_config.segment_speed_tolerance_pct:.12g}",
+        f"segment_speed_num_segments = {objective_config.segment_speed_num_segments}",
         "",
         "[initial_conditions]",
         f"initial_water_temperature_C = {initial.initial_water_temperature_C:.12g}",
@@ -337,6 +362,9 @@ def _render_effective_config(
         f'theta0_source = "{theta0_source}"',
         f"T_ref_bounds_C = {list(problem_config.T_ref_bounds_C)}",
         f"theta_bounds_C = {[list(pair) for pair in theta_bounds_C]}",
+        f"tracking_weight = {problem_config.tracking_weight:.12g}",
+        f"smoothness_weight = {problem_config.smoothness_weight:.12g}",
+        f"completion_weight = {problem_config.completion_weight:.12g}",
         f"require_monotone_nonincreasing = {str(problem_config.require_monotone_nonincreasing).lower()}",
         f"allowed_cold_extrapolation_C = {problem_config.allowed_cold_extrapolation_C:.12g}",
         (
@@ -399,7 +427,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-refinement-points", type=int, default=None)
     parser.add_argument("--local-refinement-sigma", type=float, default=None)
     parser.add_argument("--no-seed-theta0", action="store_true")
+    parser.add_argument("--tracking-weight", type=float, default=1.0)
     parser.add_argument("--smoothness-weight", type=float, default=0.02)
+    parser.add_argument("--direct-speed-weight", type=float, default=0.0)
+    parser.add_argument("--direct-speed-tolerance-pct", type=float, default=0.0)
+    parser.add_argument("--segment-speed-weight", type=float, default=0.0)
+    parser.add_argument("--segment-speed-tolerance-pct", type=float, default=0.0)
+    parser.add_argument("--segment-speed-num-segments", type=int, default=0)
     parser.add_argument("--incomplete-penalty-value", type=float, default=2.0)
     parser.add_argument("--no-characterization-admissibility", action="store_true")
     parser.add_argument("--overwrite", action="store_true")

@@ -35,6 +35,7 @@ PROBE_Z_MM = (3.0, 6.2, 11.0)
 PROBE_Z_M = tuple(value * 1.0e-3 for value in PROBE_Z_MM)
 PROBE_WALL_INSET_M = 1.0e-3
 H_OUT_W_M2K = 2.0
+SEGMENT_SPEED_NUM_SEGMENTS = 3
 
 
 def _parse_float_tuple(raw: str) -> tuple[float, ...]:
@@ -226,6 +227,84 @@ def _tracking_summary(
         "objective_mask": objective_mask.astype(np.float64),
     }
     return summary, series
+
+
+def _segment_speed_summary(
+    *,
+    series: dict[str, np.ndarray],
+    target_speed_mm_s: float,
+    z_min_mm: float,
+    z_max_mm: float,
+    num_segments: int = SEGMENT_SPEED_NUM_SEGMENTS,
+) -> tuple[dict[str, float | int], list[dict[str, float | int]]]:
+    control_time_s = series["control_time_s"]
+    z_front_mm = series["z_front_mm"]
+    finite = np.isfinite(control_time_s) & np.isfinite(z_front_mm) & (control_time_s >= 0.0)
+    boundaries = np.linspace(float(z_min_mm), float(z_max_mm), int(num_segments) + 1, dtype=np.float64)
+    crossing_times = [
+        _first_time_at_or_above(control_time_s[finite], z_front_mm[finite], float(boundary))
+        for boundary in boundaries
+    ]
+
+    rows: list[dict[str, float | int]] = []
+    speeds: list[float] = []
+    target = float(target_speed_mm_s)
+    for idx in range(int(num_segments)):
+        z0 = float(boundaries[idx])
+        z1 = float(boundaries[idx + 1])
+        t0 = float(crossing_times[idx])
+        t1 = float(crossing_times[idx + 1])
+        if math.isfinite(t0) and math.isfinite(t1) and t1 > t0:
+            speed = float((z1 - z0) / (t1 - t0))
+            signed_relative_error = float((speed - target) / target)
+            abs_relative_error_pct = float(abs(signed_relative_error) * 100.0)
+            speeds.append(speed)
+        else:
+            speed = math.nan
+            signed_relative_error = math.nan
+            abs_relative_error_pct = math.nan
+        rows.append(
+            {
+                "segment_index": int(idx),
+                "z_start_mm": z0,
+                "z_end_mm": z1,
+                "t_start_crossing_s": t0,
+                "t_end_crossing_s": t1,
+                "speed_mm_s": float(speed),
+                "signed_relative_error": float(signed_relative_error),
+                "abs_relative_error_pct": float(abs_relative_error_pct),
+            }
+        )
+
+    speed_arr = np.asarray(speeds, dtype=np.float64)
+    if speed_arr.size:
+        abs_error_pct = np.abs((speed_arr - target) / target) * 100.0
+        rmse_pct = float(np.sqrt(np.mean(abs_error_pct * abs_error_pct)))
+        mean_abs_pct = float(np.mean(abs_error_pct))
+        max_abs_pct = float(np.max(abs_error_pct))
+        min_speed = float(np.min(speed_arr))
+        max_speed = float(np.max(speed_arr))
+        spread = float(max_speed - min_speed)
+    else:
+        rmse_pct = math.nan
+        mean_abs_pct = math.nan
+        max_abs_pct = math.nan
+        min_speed = math.nan
+        max_speed = math.nan
+        spread = math.nan
+
+    summary = {
+        "target_front_speed_mm_s": target,
+        "segment_speed_num_segments": int(num_segments),
+        "segment_speed_num_valid_segments": int(speed_arr.size),
+        "segment_speed_rmse_pct": float(rmse_pct),
+        "segment_speed_mean_abs_error_pct": float(mean_abs_pct),
+        "segment_speed_max_abs_error_pct": float(max_abs_pct),
+        "segment_speed_min_mm_s": float(min_speed),
+        "segment_speed_max_mm_s": float(max_speed),
+        "segment_speed_spread_mm_s": float(spread),
+    }
+    return summary, rows
 
 
 def _thermocouple_speeds(
@@ -431,9 +510,22 @@ def _write_report(
     config: VelocityControlFileConfig,
     timing: dict[str, str],
     summary: dict[str, float],
+    segment_summary: dict[str, float | int],
+    segment_rows: list[dict[str, float | int]],
     plate_summary: PlateTrackingSummary,
     tc_rows: list[dict[str, float | str]],
 ) -> None:
+    segment_lines = []
+    for row in segment_rows:
+        speed = row["speed_mm_s"]
+        speed_text = f"{float(speed):.6g} mm/s" if math.isfinite(float(speed)) else "not reached"
+        error = row["abs_relative_error_pct"]
+        error_text = f"{float(error):.6g}%" if math.isfinite(float(error)) else "nan"
+        segment_lines.append(
+            f"- segment {int(row['segment_index'])}: "
+            f"{row['z_start_mm']:.3g}-{row['z_end_mm']:.3g} mm, "
+            f"{speed_text}, abs. error {error_text}"
+        )
     tc_lines = []
     for row in tc_rows:
         speed = row["speed_mm_s"]
@@ -466,6 +558,18 @@ def _write_report(
                 f"- Actual interval speed: `{summary['actual_interval_speed_mm_s']:.6g} mm/s`",
                 f"- Tracking RMSE: `{summary['tracking_rmse_mm']:.6g} mm`",
                 f"- Number of tracking samples: `{int(summary['num_tracking_samples'])}`",
+                "",
+                "## Segment-Speed Summary",
+                "",
+                (
+                    "- Segment-speed RMSE: "
+                    f"`{float(segment_summary['segment_speed_rmse_pct']):.6g}%`"
+                ),
+                (
+                    "- Segment-speed spread: "
+                    f"`{float(segment_summary['segment_speed_spread_mm_s']):.6g} mm/s`"
+                ),
+                *segment_lines,
                 "",
                 "## Plate Tracking Summary",
                 "",
@@ -663,6 +767,12 @@ def main() -> None:
         z_min_mm=config.velocity_target.control_z_min_mm,
         z_max_mm=config.velocity_target.control_z_max_mm,
     )
+    segment_summary, segment_rows = _segment_speed_summary(
+        series=series,
+        target_speed_mm_s=config.velocity_target.target_front_speed_mm_s,
+        z_min_mm=config.velocity_target.control_z_min_mm,
+        z_max_mm=config.velocity_target.control_z_max_mm,
+    )
     tc_rows = _thermocouple_speeds(
         probes_path=result.probes_path,
         cooling_start_time_s=cooling_start_time_s,
@@ -681,6 +791,8 @@ def main() -> None:
     )
 
     _write_single_row_csv(output_dir / "velocity_tracking_summary.csv", summary)
+    _write_single_row_csv(output_dir / "segment_speed_summary.csv", segment_summary)
+    _write_rows_csv(output_dir / "segment_interval_speeds.csv", segment_rows)
     _write_rows_csv(output_dir / "thermocouple_interval_speeds.csv", tc_rows)
     write_plate_tracking_summary_csv(output_dir / "plate_tracking_summary.csv", plate_summary)
     write_plate_tracking_timeseries_csv(output_dir / "T_ref_T_plate_timeseries.csv", plate_series)
@@ -702,6 +814,8 @@ def main() -> None:
         config=config,
         timing=timing,
         summary=summary,
+        segment_summary=segment_summary,
+        segment_rows=segment_rows,
         plate_summary=plate_summary,
         tc_rows=tc_rows,
     )
@@ -709,6 +823,7 @@ def main() -> None:
     print(f"Velocity-control evaluation written to {output_dir.resolve()}")
     print(f"  effective config: {effective_config_path.resolve()}")
     print(f"  tracking summary: {(output_dir / 'velocity_tracking_summary.csv').resolve()}")
+    print(f"  segment summary : {(output_dir / 'segment_speed_summary.csv').resolve()}")
     print(f"  plate summary   : {(output_dir / 'plate_tracking_summary.csv').resolve()}")
     print(f"  report          : {(output_dir / 'velocity_control_report.md').resolve()}")
 

@@ -1,0 +1,7 @@
+quantity,symbol,code_field,value,unit,estimation
+Representative plate-temperature response time constant,median tau,tau_s,98.088190,s,Median of the setpoint-dependent response-time lookup.
+Linear summary gain for the steady-state lookup,g,gain,1.007606,dimensionless,"Least-squares linear summary of the fitted T_plate,ss(T_ref) lookup."
+Linear summary offset for the steady-state lookup,b,offset_C,0.386078,deg C,"Least-squares linear summary of the fitted T_plate,ss(T_ref) lookup."
+Characterized reference temperatures,T_ref,reference_temperatures_C,"-20, -15, -10, -5",deg C,Nominal setpoints of the active dry-cooling characterization assays.
+Setpoint-dependent response time constants,tau(T_ref),response_tau_s,"75.296, 98.220, 97.957, 99.014",s,Independent active step-response trajectory fit at each characterized setpoint.
+Setpoint-dependent steady plate temperatures,"T_plate,ss(T_ref)",steady_plate_C,"-19.769, -14.762, -9.612, -4.693",deg C,Independent active step-response trajectory fit at each characterized setpoint.

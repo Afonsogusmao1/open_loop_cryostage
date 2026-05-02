@@ -12,7 +12,11 @@ from pathlib import Path
 
 import numpy as np
 
-from code_simulation.simulation.cryostage_model import CryostageModelParams, DEFAULT_CRYOSTAGE_PARAMS
+from code_simulation.simulation.cryostage_model import (
+    CryostageModelParams,
+    DEFAULT_CRYOSTAGE_PARAMS,
+    cryostage_params_from_dict,
+)
 from code_simulation.simulation.open_loop_cascade import run_open_loop_case
 from code_simulation.core.config_files import (
     DEFAULT_SIMULATION_CONFIG_PATH,
@@ -83,11 +87,7 @@ def _cryostage_params_from_summary(summary: dict[str, str]) -> CryostageModelPar
     if raw is None:
         return DEFAULT_CRYOSTAGE_PARAMS
     params = json.loads(raw)
-    return CryostageModelParams(
-        tau_s=float(params["tau_s"]),
-        gain=float(params["gain"]),
-        offset_C=float(params["offset_C"]),
-    )
+    return cryostage_params_from_dict(params)
 
 
 def _load_early_drop_case(summary_path: Path) -> tuple[DiagnosticCase, CryostageModelParams]:

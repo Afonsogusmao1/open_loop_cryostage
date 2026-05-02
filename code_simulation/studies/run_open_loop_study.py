@@ -17,7 +17,11 @@ import numpy as np
 
 from code_simulation.core.paths import results_dir
 from code_simulation.core.plotting import configure_matplotlib
-from code_simulation.simulation.cryostage_model import DEFAULT_CRYOSTAGE_PARAMS, simulate_plate_temperature
+from code_simulation.simulation.cryostage_model import (
+    DEFAULT_CRYOSTAGE_PARAMS,
+    cryostage_params_to_dict,
+    simulate_plate_temperature,
+)
 from code_simulation.optimization.open_loop_optimizer import OpenLoopOptimizationResult, optimize_open_loop_theta
 from code_simulation.optimization.open_loop_problem import build_front_reference, build_reference_profile_from_theta, load_front_csv
 from code_simulation.optimization.open_loop_workflow_config import DEFAULT_THETA0, build_problem_config
@@ -380,9 +384,7 @@ def main() -> None:
             "cryostage_params",
             json.dumps(
                 {
-                    "tau_s": float(DEFAULT_CRYOSTAGE_PARAMS.tau_s),
-                    "gain": float(DEFAULT_CRYOSTAGE_PARAMS.gain),
-                    "offset_C": float(DEFAULT_CRYOSTAGE_PARAMS.offset_C),
+                    **cryostage_params_to_dict(DEFAULT_CRYOSTAGE_PARAMS),
                 }
             ),
         ),
